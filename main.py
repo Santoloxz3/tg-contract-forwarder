@@ -8,29 +8,22 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 
-API_ID = int(os.environ["TELEGRAM_API_ID"])
-API_HASH = os.environ["TELEGRAM_API_HASH"].strip()
-SESSION_STRING = os.environ["TELEGRAM_SESSION_STRING"].strip()
-SOURCE_CHAT = os.environ["SOURCE_CHAT"].strip()
-SOURCE_SENDER = os.getenv("SOURCE_SENDER", "").strip()
-DESTINATION_BOT = os.environ["DESTINATION_BOT"].strip()
-ADDRESS_TYPES = {x.strip().lower() for x in os.getenv("ADDRESS_TYPES", "evm").split(",") if x.strip()}
-REQUIRE_KEYWORD = os.getenv("REQUIRE_KEYWORD", "").strip().lower()
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes", "on"}
-FORWARD_DELAY_SECONDS = float(os.getenv("FORWARD_DELAY_SECONDS", "0"))
-MAX_RECENT_ADDRESSES = int(os.getenv("MAX_RECENT_ADDRESSES", "500"))
-
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("tg-contract-forwarder")
+
+REQUIRED_VARS = [
+    "TELEGRAM_API_ID",
+    "TELEGRAM_API_HASH",
+    "TELEGRAM_SESSION_STRING",
+    "SOURCE_CHAT",
+    "DESTINATION_BOT",
+]
 
 PATTERNS = {
     "evm": re.compile(r"(?<![0-9a-fA-F])0x[a-fA-F0-9]{40}(?![0-9a-fA-F])"),
     "sui": re.compile(r"(?<![0-9a-fA-F])0x[a-fA-F0-9]{64}(?![0-9a-fA-F])"),
     "solana": re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])"),
 }
-
-recent_queue = deque(maxlen=MAX_RECENT_ADDRESSES)
-recent_set = set()
 
 
 def parse_peer(value: str):
@@ -40,46 +33,87 @@ def parse_peer(value: str):
     return value
 
 
-def extract_addresses(text: str):
-    out = []
-    seen = set()
-    for kind in ADDRESS_TYPES:
-        pattern = PATTERNS.get(kind)
-        if not pattern:
-            continue
-        for match in pattern.findall(text):
-            key = match.lower() if match.startswith("0x") else match
-            if key not in seen:
-                seen.add(key)
-                out.append((kind, match))
-    return out
-
-
-def already_sent(address: str) -> bool:
-    key = address.lower() if address.startswith("0x") else address
-    return key in recent_set
-
-
-def remember_sent(address: str):
-    key = address.lower() if address.startswith("0x") else address
-    if key in recent_set:
-        return
-    if len(recent_queue) == recent_queue.maxlen and recent_queue:
-        recent_set.discard(recent_queue[0])
-    recent_queue.append(key)
-    recent_set.add(key)
+async def wait_for_configuration():
+    missing = [name for name in REQUIRED_VARS if not os.getenv(name, "").strip()]
+    if not missing:
+        return False
+    log.warning("Configuration incomplete. Missing Railway variables: %s", ", ".join(missing))
+    log.warning("Service is online but idle. Add the missing variables in Railway to activate it.")
+    while True:
+        await asyncio.sleep(3600)
 
 
 async def main():
-    source_chat = parse_peer(SOURCE_CHAT)
-    source_sender = parse_peer(SOURCE_SENDER) if SOURCE_SENDER else None
-    destination = parse_peer(DESTINATION_BOT)
+    await wait_for_configuration()
 
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, connection_retries=None, retry_delay=3, auto_reconnect=True)
+    api_id = int(os.environ["TELEGRAM_API_ID"])
+    api_hash = os.environ["TELEGRAM_API_HASH"].strip()
+    session_string = os.environ["TELEGRAM_SESSION_STRING"].strip()
+    source_chat_raw = os.environ["SOURCE_CHAT"].strip()
+    source_sender_raw = os.getenv("SOURCE_SENDER", "").strip()
+    destination_raw = os.environ["DESTINATION_BOT"].strip()
+
+    address_types = {x.strip().lower() for x in os.getenv("ADDRESS_TYPES", "evm").split(",") if x.strip()}
+    require_keyword = os.getenv("REQUIRE_KEYWORD", "").strip().lower()
+    dry_run = os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes", "on"}
+    forward_delay_seconds = float(os.getenv("FORWARD_DELAY_SECONDS", "0"))
+    max_recent_addresses = int(os.getenv("MAX_RECENT_ADDRESSES", "500"))
+
+    recent_queue = deque(maxlen=max_recent_addresses)
+    recent_set = set()
+
+    def extract_addresses(text: str):
+        out = []
+        seen = set()
+        for kind in address_types:
+            pattern = PATTERNS.get(kind)
+            if not pattern:
+                log.warning("Unknown ADDRESS_TYPES value ignored: %s", kind)
+                continue
+            for match in pattern.findall(text):
+                key = match.lower() if match.startswith("0x") else match
+                if key not in seen:
+                    seen.add(key)
+                    out.append((kind, match))
+        return out
+
+    def already_sent(address: str) -> bool:
+        key = address.lower() if address.startswith("0x") else address
+        return key in recent_set
+
+    def remember_sent(address: str):
+        key = address.lower() if address.startswith("0x") else address
+        if key in recent_set:
+            return
+        if len(recent_queue) == recent_queue.maxlen and recent_queue:
+            recent_set.discard(recent_queue[0])
+        recent_queue.append(key)
+        recent_set.add(key)
+
+    source_chat = parse_peer(source_chat_raw)
+    source_sender = parse_peer(source_sender_raw) if source_sender_raw else None
+    destination = parse_peer(destination_raw)
+
+    client = TelegramClient(
+        StringSession(session_string),
+        api_id,
+        api_hash,
+        connection_retries=None,
+        retry_delay=3,
+        auto_reconnect=True,
+    )
+
     await client.start()
     me = await client.get_me()
     log.info("Logged in as %s (%s)", getattr(me, "username", None) or getattr(me, "first_name", "unknown"), me.id)
-    log.info("Listening on source=%s sender=%s destination=%s dry_run=%s", SOURCE_CHAT, SOURCE_SENDER or "ANY", DESTINATION_BOT, DRY_RUN)
+    log.info(
+        "Listening source=%s sender=%s destination=%s address_types=%s dry_run=%s",
+        source_chat_raw,
+        source_sender_raw or "ANY",
+        destination_raw,
+        ",".join(sorted(address_types)),
+        dry_run,
+    )
 
     @client.on(events.NewMessage(chats=source_chat))
     async def on_new_message(event):
@@ -100,7 +134,7 @@ async def main():
                     if not sender_username or sender_username.lower() != wanted:
                         return
 
-            if REQUIRE_KEYWORD and REQUIRE_KEYWORD not in text.lower():
+            if require_keyword and require_keyword not in text.lower():
                 return
 
             for kind, address in extract_addresses(text):
@@ -109,11 +143,12 @@ async def main():
                     continue
 
                 log.info("Detected %s contract: %s", kind, address)
-                if FORWARD_DELAY_SECONDS > 0:
-                    await asyncio.sleep(FORWARD_DELAY_SECONDS)
 
-                if DRY_RUN:
-                    log.info("[DRY_RUN] Would send to %s: %s", DESTINATION_BOT, address)
+                if forward_delay_seconds > 0:
+                    await asyncio.sleep(forward_delay_seconds)
+
+                if dry_run:
+                    log.info("[DRY_RUN] Would send to %s: %s", destination_raw, address)
                     remember_sent(address)
                     continue
 
