@@ -32,6 +32,7 @@ PATTERNS = {
     "solana": re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])"),
 }
 ALLOWED_ADDRESS_TYPES = {"evm", "solana", "sui"}
+ALLOWED_EVENT_ACTIONS = {"forwarded", "duplicate_ignored", "dry_run", "error"}
 
 
 def parse_peer(value: str):
@@ -76,6 +77,23 @@ def open_db(path: str):
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ca_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            chain_type TEXT,
+            address TEXT,
+            action TEXT NOT NULL,
+            detail TEXT,
+            source_chat TEXT,
+            destination_bot TEXT
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ca_events_event_at ON ca_events(event_at DESC, id DESC)"
     )
     connection.commit()
     return connection
@@ -154,6 +172,48 @@ def mark_forwarded(db, kind: str, address: str):
 def forwarded_count(db) -> int:
     row = db.execute("SELECT COUNT(*) AS n FROM forwarded_contracts").fetchone()
     return int(row["n"])
+
+
+def add_event(
+    db,
+    action: str,
+    kind: str | None,
+    address: str | None,
+    source_chat: str,
+    destination_bot: str,
+    detail: str | None = None,
+):
+    if action not in ALLOWED_EVENT_ACTIONS:
+        action = "error"
+    db.execute(
+        """
+        INSERT INTO ca_events(chain_type, address, action, detail, source_chat, destination_bot)
+        VALUES(?, ?, ?, ?, ?, ?)
+        """,
+        (
+            kind,
+            normalize_address(address) if address else None,
+            action,
+            detail[:500] if detail else None,
+            source_chat,
+            destination_bot,
+        ),
+    )
+    db.commit()
+
+
+def recent_events(db, limit: int = 50):
+    limit = max(1, min(200, int(limit)))
+    rows = db.execute(
+        """
+        SELECT id, event_at, chain_type, address, action, detail, source_chat, destination_bot
+        FROM ca_events
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def extract_first_contract(text: str, enabled_types: set[str]):
@@ -262,6 +322,9 @@ async def main():
 
     @client.on(events.NewMessage)
     async def on_new_message(event):
+        kind = None
+        address = None
+        config_snapshot = None
         try:
             if event.chat_id != runtime["source_chat_id"]:
                 return
@@ -287,6 +350,8 @@ async def main():
 
             config_snapshot = runtime["config"].copy()
             config_snapshot["address_types"] = set(runtime["config"]["address_types"])
+            destination_entity_snapshot = runtime["destination_entity"]
+
             result = extract_first_contract(text, config_snapshot["address_types"])
             if not result:
                 return
@@ -294,11 +359,21 @@ async def main():
             kind, address = result
 
             async with processing_lock:
+                now = datetime.now(timezone.utc).isoformat()
+                runtime["last_address"] = address
+                runtime["last_chain"] = kind
+                runtime["last_event_at"] = now
+
                 if is_forwarded(db, address):
-                    runtime["last_address"] = address
-                    runtime["last_chain"] = kind
                     runtime["last_action"] = "duplicate_ignored"
-                    runtime["last_event_at"] = datetime.now(timezone.utc).isoformat()
+                    add_event(
+                        db,
+                        "duplicate_ignored",
+                        kind,
+                        address,
+                        config_snapshot["source_chat_raw"],
+                        config_snapshot["destination_raw"],
+                    )
                     log.info("Duplicate ignored: %s", address)
                     return
 
@@ -306,24 +381,40 @@ async def main():
                 if config_snapshot["forward_delay_seconds"]:
                     await asyncio.sleep(config_snapshot["forward_delay_seconds"])
 
-                runtime["last_address"] = address
-                runtime["last_chain"] = kind
-                runtime["last_event_at"] = datetime.now(timezone.utc).isoformat()
-
                 if config_snapshot["dry_run"]:
                     runtime["last_action"] = "dry_run"
-                    log.info("[DRY_RUN] Would send to %s: %s", config_snapshot["destination_raw"], address)
+                    add_event(
+                        db,
+                        "dry_run",
+                        kind,
+                        address,
+                        config_snapshot["source_chat_raw"],
+                        config_snapshot["destination_raw"],
+                    )
+                    log.info(
+                        "[DRY_RUN] Would send to %s: %s",
+                        config_snapshot["destination_raw"],
+                        address,
+                    )
                     return
 
-                destination_entity = runtime["destination_entity"]
                 try:
-                    sent = await client.send_message(destination_entity, address)
+                    sent = await client.send_message(destination_entity_snapshot, address)
                 except FloodWaitError as exc:
                     log.warning("Telegram FloodWait: %ss", exc.seconds)
                     await asyncio.sleep(exc.seconds + 1)
-                    sent = await client.send_message(destination_entity, address)
+                    sent = await client.send_message(destination_entity_snapshot, address)
 
                 mark_forwarded(db, kind, address)
+                add_event(
+                    db,
+                    "forwarded",
+                    kind,
+                    address,
+                    config_snapshot["source_chat_raw"],
+                    config_snapshot["destination_raw"],
+                    f"message_id={sent.id}",
+                )
                 runtime["last_action"] = "forwarded"
                 log.info("Forwarded successfully, message_id=%s", sent.id)
 
@@ -331,6 +422,16 @@ async def main():
             runtime["last_error"] = str(exc)
             runtime["last_action"] = "error"
             runtime["last_event_at"] = datetime.now(timezone.utc).isoformat()
+            if address and config_snapshot:
+                add_event(
+                    db,
+                    "error",
+                    kind,
+                    address,
+                    config_snapshot["source_chat_raw"],
+                    config_snapshot["destination_raw"],
+                    str(exc),
+                )
             log.exception("Error processing Telegram message")
 
     def is_authenticated(request):
@@ -345,13 +446,17 @@ async def main():
         data = await request.post()
         if not panel_password:
             return web.Response(
-                text=LOGIN_HTML.format(error='<div class="err">PANEL_PASSWORD non configurata su Railway.</div>'),
+                text=LOGIN_HTML.format(
+                    error='<div class="err">PANEL_PASSWORD non configurata su Railway.</div>'
+                ),
                 content_type="text/html",
                 status=503,
             )
         if data.get("password", "") != panel_password:
             return web.Response(
-                text=LOGIN_HTML.format(error='<div class="err">Password non corretta. Riprova 👀</div>'),
+                text=LOGIN_HTML.format(
+                    error='<div class="err">Password non corretta. Riprova 👀</div>'
+                ),
                 content_type="text/html",
                 status=401,
             )
@@ -375,27 +480,33 @@ async def main():
         if not is_authenticated(request):
             raise web.HTTPFound("/login")
         panel_path = Path(__file__).with_name("panel.html")
-        return web.Response(text=panel_path.read_text(encoding="utf-8"), content_type="text/html")
+        return web.Response(
+            text=panel_path.read_text(encoding="utf-8"),
+            content_type="text/html",
+        )
 
     async def api_config_get(request):
         if not is_authenticated(request):
             raise web.HTTPUnauthorized()
         cfg = runtime["config"]
-        return web.json_response({
-            "source_chat": cfg["source_chat_raw"],
-            "destination_bot": cfg["destination_raw"],
-            "dry_run": cfg["dry_run"],
-            "forward_delay_seconds": cfg["forward_delay_seconds"],
-            "address_types": sorted(cfg["address_types"]),
-            "status": runtime["status"],
-            "telegram_user": getattr(me, "username", None) or getattr(me, "first_name", "unknown"),
-            "forwarded_count": forwarded_count(db),
-            "last_address": runtime["last_address"],
-            "last_chain": runtime["last_chain"],
-            "last_action": runtime["last_action"],
-            "last_event_at": runtime["last_event_at"],
-            "last_error": runtime["last_error"],
-        })
+        return web.json_response(
+            {
+                "source_chat": cfg["source_chat_raw"],
+                "destination_bot": cfg["destination_raw"],
+                "dry_run": cfg["dry_run"],
+                "forward_delay_seconds": cfg["forward_delay_seconds"],
+                "address_types": sorted(cfg["address_types"]),
+                "status": runtime["status"],
+                "telegram_user": getattr(me, "username", None)
+                or getattr(me, "first_name", "unknown"),
+                "forwarded_count": forwarded_count(db),
+                "last_address": runtime["last_address"],
+                "last_chain": runtime["last_chain"],
+                "last_action": runtime["last_action"],
+                "last_event_at": runtime["last_event_at"],
+                "last_error": runtime["last_error"],
+            }
+        )
 
     async def api_config_post(request):
         if not is_authenticated(request):
@@ -444,6 +555,20 @@ async def main():
             runtime["last_error"] = str(exc)
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
+    async def api_history_get(request):
+        if not is_authenticated(request):
+            raise web.HTTPUnauthorized()
+        try:
+            limit = int(request.query.get("limit", "50"))
+        except ValueError:
+            limit = 50
+        return web.json_response(
+            {
+                "events": recent_events(db, limit),
+                "forwarded_count": forwarded_count(db),
+            }
+        )
+
     async def health_get(request):
         return web.json_response({"ok": True, "bot": runtime["status"]})
 
@@ -454,6 +579,7 @@ async def main():
     app.router.add_get("/", panel_get)
     app.router.add_get("/api/config", api_config_get)
     app.router.add_post("/api/config", api_config_post)
+    app.router.add_get("/api/history", api_history_get)
     app.router.add_get("/health", health_get)
 
     runner = web.AppRunner(app)
