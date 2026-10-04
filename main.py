@@ -2,13 +2,17 @@ import asyncio
 import logging
 import os
 import re
-from collections import deque
+import sqlite3
+from pathlib import Path
 
 from telethon import TelegramClient, events
-from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
+from telethon.sessions import StringSession
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 log = logging.getLogger("tg-contract-forwarder")
 
 REQUIRED_VARS = [
@@ -19,9 +23,10 @@ REQUIRED_VARS = [
     "DESTINATION_BOT",
 ]
 
+# Order matters: longer 0x addresses are checked before EVM addresses.
 PATTERNS = {
-    "evm": re.compile(r"(?<![0-9a-fA-F])0x[a-fA-F0-9]{40}(?![0-9a-fA-F])"),
     "sui": re.compile(r"(?<![0-9a-fA-F])0x[a-fA-F0-9]{64}(?![0-9a-fA-F])"),
+    "evm": re.compile(r"(?<![0-9a-fA-F])0x[a-fA-F0-9]{40}(?![0-9a-fA-F])"),
     "solana": re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])"),
 }
 
@@ -33,14 +38,68 @@ def parse_peer(value: str):
     return value
 
 
+def normalize_address(address: str) -> str:
+    return address.lower() if address.startswith("0x") else address
+
+
 async def wait_for_configuration():
     missing = [name for name in REQUIRED_VARS if not os.getenv(name, "").strip()]
     if not missing:
-        return False
+        return
     log.warning("Configuration incomplete. Missing Railway variables: %s", ", ".join(missing))
-    log.warning("Service is online but idle. Add the missing variables in Railway to activate it.")
     while True:
         await asyncio.sleep(3600)
+
+
+def open_history_db(path: str):
+    db_path = Path(path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS forwarded_contracts (
+            address TEXT PRIMARY KEY,
+            chain_type TEXT NOT NULL,
+            forwarded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.commit()
+    return connection
+
+
+def is_forwarded(db, address: str) -> bool:
+    key = normalize_address(address)
+    row = db.execute(
+        "SELECT 1 FROM forwarded_contracts WHERE address = ? LIMIT 1", (key,)
+    ).fetchone()
+    return row is not None
+
+
+def mark_forwarded(db, kind: str, address: str):
+    key = normalize_address(address)
+    db.execute(
+        "INSERT OR IGNORE INTO forwarded_contracts(address, chain_type) VALUES(?, ?)",
+        (key, kind),
+    )
+    db.commit()
+
+
+def extract_first_contract(text: str, enabled_types: set[str]):
+    candidates = []
+    for kind in ("sui", "evm", "solana"):
+        if kind not in enabled_types:
+            continue
+        for match in PATTERNS[kind].finditer(text):
+            candidates.append((match.start(), kind, match.group(0)))
+
+    if not candidates:
+        return None
+
+    # If patterns ever overlap, prefer the earliest match, then the longer address.
+    candidates.sort(key=lambda item: (item[0], -len(item[2])))
+    _, kind, address = candidates[0]
+    return kind, address
 
 
 async def main():
@@ -53,42 +112,18 @@ async def main():
     source_sender_raw = os.getenv("SOURCE_SENDER", "").strip()
     destination_raw = os.environ["DESTINATION_BOT"].strip()
 
-    address_types = {x.strip().lower() for x in os.getenv("ADDRESS_TYPES", "evm").split(",") if x.strip()}
+    address_types = {
+        item.strip().lower()
+        for item in os.getenv("ADDRESS_TYPES", "evm,solana,sui").split(",")
+        if item.strip()
+    }
     require_keyword = os.getenv("REQUIRE_KEYWORD", "").strip().lower()
     dry_run = os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes", "on"}
-    forward_delay_seconds = float(os.getenv("FORWARD_DELAY_SECONDS", "0"))
-    max_recent_addresses = int(os.getenv("MAX_RECENT_ADDRESSES", "500"))
+    forward_delay_seconds = max(0.0, float(os.getenv("FORWARD_DELAY_SECONDS", "2")))
+    history_db_path = os.getenv("HISTORY_DB_PATH", "/data/forwarded_contracts.sqlite3")
 
-    recent_queue = deque(maxlen=max_recent_addresses)
-    recent_set = set()
-
-    def extract_addresses(text: str):
-        out = []
-        seen = set()
-        for kind in address_types:
-            pattern = PATTERNS.get(kind)
-            if not pattern:
-                log.warning("Unknown ADDRESS_TYPES value ignored: %s", kind)
-                continue
-            for match in pattern.findall(text):
-                key = match.lower() if match.startswith("0x") else match
-                if key not in seen:
-                    seen.add(key)
-                    out.append((kind, match))
-        return out
-
-    def already_sent(address: str) -> bool:
-        key = address.lower() if address.startswith("0x") else address
-        return key in recent_set
-
-    def remember_sent(address: str):
-        key = address.lower() if address.startswith("0x") else address
-        if key in recent_set:
-            return
-        if len(recent_queue) == recent_queue.maxlen and recent_queue:
-            recent_set.discard(recent_queue[0])
-        recent_queue.append(key)
-        recent_set.add(key)
+    db = open_history_db(history_db_path)
+    processing_lock = asyncio.Lock()
 
     source_chat = parse_peer(source_chat_raw)
     source_sender = parse_peer(source_sender_raw) if source_sender_raw else None
@@ -105,14 +140,23 @@ async def main():
 
     await client.start()
     me = await client.get_me()
-    log.info("Logged in as %s (%s)", getattr(me, "username", None) or getattr(me, "first_name", "unknown"), me.id)
+    await client.get_entity(source_chat)
+    await client.get_entity(destination)
+
     log.info(
-        "Listening source=%s sender=%s destination=%s address_types=%s dry_run=%s",
+        "Logged in as %s (%s)",
+        getattr(me, "username", None) or getattr(me, "first_name", "unknown"),
+        me.id,
+    )
+    log.info(
+        "Listening source=%s sender=%s destination=%s address_types=%s dry_run=%s delay=%ss history=%s",
         source_chat_raw,
         source_sender_raw or "ANY",
         destination_raw,
         ",".join(sorted(address_types)),
         dry_run,
+        forward_delay_seconds,
+        history_db_path,
     )
 
     @client.on(events.NewMessage(chats=source_chat))
@@ -137,36 +181,44 @@ async def main():
             if require_keyword and require_keyword not in text.lower():
                 return
 
-            for kind, address in extract_addresses(text):
-                if already_sent(address):
+            result = extract_first_contract(text, address_types)
+            if not result:
+                return
+
+            kind, address = result
+
+            async with processing_lock:
+                if is_forwarded(db, address):
                     log.info("Duplicate ignored: %s", address)
-                    continue
+                    return
 
                 log.info("Detected %s contract: %s", kind, address)
 
-                if forward_delay_seconds > 0:
+                if forward_delay_seconds:
                     await asyncio.sleep(forward_delay_seconds)
 
                 if dry_run:
                     log.info("[DRY_RUN] Would send to %s: %s", destination_raw, address)
-                    remember_sent(address)
-                    continue
+                    return
 
                 try:
                     sent = await client.send_message(destination, address)
-                except FloodWaitError as e:
-                    log.warning("FloodWait %ss", e.seconds)
-                    await asyncio.sleep(e.seconds + 1)
+                except FloodWaitError as exc:
+                    log.warning("Telegram FloodWait: %ss", exc.seconds)
+                    await asyncio.sleep(exc.seconds + 1)
                     sent = await client.send_message(destination, address)
 
-                remember_sent(address)
-                log.info("Sent successfully, message_id=%s", sent.id)
+                mark_forwarded(db, kind, address)
+                log.info("Forwarded successfully, message_id=%s", sent.id)
 
         except Exception:
             log.exception("Error processing Telegram message")
 
     log.info("Userbot running")
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
