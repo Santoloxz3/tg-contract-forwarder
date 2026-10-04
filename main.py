@@ -3,11 +3,14 @@ import logging
 import os
 import re
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
+from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
+from telethon.utils import get_peer_id
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -23,12 +26,12 @@ REQUIRED_VARS = [
     "DESTINATION_BOT",
 ]
 
-# Order matters: longer 0x addresses are checked before EVM addresses.
 PATTERNS = {
     "sui": re.compile(r"(?<![0-9a-fA-F])0x[a-fA-F0-9]{64}(?![0-9a-fA-F])"),
     "evm": re.compile(r"(?<![0-9a-fA-F])0x[a-fA-F0-9]{40}(?![0-9a-fA-F])"),
     "solana": re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])"),
 }
+ALLOWED_ADDRESS_TYPES = {"evm", "solana", "sui"}
 
 
 def parse_peer(value: str):
@@ -51,10 +54,11 @@ async def wait_for_configuration():
         await asyncio.sleep(3600)
 
 
-def open_history_db(path: str):
+def open_db(path: str):
     db_path = Path(path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS forwarded_contracts (
@@ -64,25 +68,92 @@ def open_history_db(path: str):
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
     connection.commit()
     return connection
 
 
+def setting_get(db, key: str, fallback: str) -> str:
+    row = db.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else fallback
+
+
+def setting_set(db, key: str, value: str):
+    db.execute(
+        """
+        INSERT INTO bot_settings(key, value, updated_at)
+        VALUES(?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (key, value),
+    )
+
+
+def save_config(db, config: dict):
+    setting_set(db, "source_chat", config["source_chat_raw"])
+    setting_set(db, "destination_bot", config["destination_raw"])
+    setting_set(db, "dry_run", "true" if config["dry_run"] else "false")
+    setting_set(db, "forward_delay_seconds", str(config["forward_delay_seconds"]))
+    setting_set(db, "address_types", ",".join(sorted(config["address_types"])))
+    db.commit()
+
+
+def load_saved_config(db) -> dict:
+    env_types = os.getenv("ADDRESS_TYPES", "evm,solana,sui")
+    address_types = {
+        item.strip().lower()
+        for item in setting_get(db, "address_types", env_types).split(",")
+        if item.strip().lower() in ALLOWED_ADDRESS_TYPES
+    }
+    if not address_types:
+        address_types = {"evm", "solana", "sui"}
+
+    dry_raw = setting_get(db, "dry_run", os.getenv("DRY_RUN", "true"))
+    delay_raw = setting_get(db, "forward_delay_seconds", os.getenv("FORWARD_DELAY_SECONDS", "2"))
+
+    try:
+        delay = max(0.0, min(30.0, float(delay_raw)))
+    except ValueError:
+        delay = 2.0
+
+    return {
+        "source_chat_raw": setting_get(db, "source_chat", os.environ["SOURCE_CHAT"]).strip(),
+        "destination_raw": setting_get(db, "destination_bot", os.environ["DESTINATION_BOT"]).strip(),
+        "dry_run": dry_raw.lower() in {"1", "true", "yes", "on"},
+        "forward_delay_seconds": delay,
+        "address_types": address_types,
+    }
+
+
 def is_forwarded(db, address: str) -> bool:
-    key = normalize_address(address)
     row = db.execute(
-        "SELECT 1 FROM forwarded_contracts WHERE address = ? LIMIT 1", (key,)
+        "SELECT 1 FROM forwarded_contracts WHERE address = ? LIMIT 1",
+        (normalize_address(address),),
     ).fetchone()
     return row is not None
 
 
 def mark_forwarded(db, kind: str, address: str):
-    key = normalize_address(address)
     db.execute(
         "INSERT OR IGNORE INTO forwarded_contracts(address, chain_type) VALUES(?, ?)",
-        (key, kind),
+        (normalize_address(address), kind),
     )
     db.commit()
+
+
+def forwarded_count(db) -> int:
+    row = db.execute("SELECT COUNT(*) AS n FROM forwarded_contracts").fetchone()
+    return int(row["n"])
 
 
 def extract_first_contract(text: str, enabled_types: set[str]):
@@ -96,10 +167,17 @@ def extract_first_contract(text: str, enabled_types: set[str]):
     if not candidates:
         return None
 
-    # If patterns ever overlap, prefer the earliest match, then the longer address.
     candidates.sort(key=lambda item: (item[0], -len(item[2])))
     _, kind, address = candidates[0]
     return kind, address
+
+
+LOGIN_HTML = """<!doctype html>
+<html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CA Courier • Login</title>
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:radial-gradient(circle at 20% 20%,#23356f 0,transparent 36%),radial-gradient(circle at 80% 10%,#743d89 0,transparent 34%),#0b1020;color:#edf1ff;padding:24px}.card{width:min(430px,100%);background:rgba(18,24,48,.86);border:1px solid rgba(255,255,255,.11);border-radius:28px;padding:30px;box-shadow:0 24px 80px rgba(0,0,0,.38);backdrop-filter:blur(16px)}.bot{width:72px;height:72px;border-radius:22px;display:grid;place-items:center;font-size:34px;background:linear-gradient(145deg,#88a7ff,#bd83ff);box-shadow:0 12px 34px rgba(112,116,255,.32);margin-bottom:22px}h1{font-size:30px;margin:0 0 8px}.sub{color:#aeb8d9;line-height:1.5;margin:0 0 26px}label{display:block;font-size:13px;color:#b8c1df;margin-bottom:8px;font-weight:700}input{width:100%;border:1px solid #344064;background:#0d1429;color:#fff;padding:15px 16px;border-radius:15px;outline:none;font-size:16px}input:focus{border-color:#8da7ff;box-shadow:0 0 0 4px rgba(126,151,255,.12)}button{width:100%;border:0;border-radius:15px;padding:15px;font-size:15px;font-weight:800;margin-top:15px;background:linear-gradient(135deg,#8ea8ff,#b87cff);color:#11172d;cursor:pointer}.err{background:rgba(255,103,122,.12);border:1px solid rgba(255,103,122,.25);color:#ffb2bd;padding:11px 13px;border-radius:13px;margin-bottom:15px;font-size:13px}.tiny{margin-top:18px;text-align:center;color:#727eaa;font-size:12px}</style></head>
+<body><form class="card" method="post" action="/login"><div class="bot">🤖</div><h1>CA Courier</h1><p class="sub">Il piccolo corriere dei contract address. Accesso al pannello di controllo.</p>{error}<label>Password pannello</label><input type="password" name="password" autocomplete="current-password" autofocus placeholder="••••••••••••"><button type="submit">Apri il pannello ✨</button><div class="tiny">Railway • Telegram listener • Persistent history</div></form></body></html>"""
 
 
 async def main():
@@ -108,26 +186,29 @@ async def main():
     api_id = int(os.environ["TELEGRAM_API_ID"])
     api_hash = os.environ["TELEGRAM_API_HASH"].strip()
     session_string = os.environ["TELEGRAM_SESSION_STRING"].strip()
-    source_chat_raw = os.environ["SOURCE_CHAT"].strip()
     source_sender_raw = os.getenv("SOURCE_SENDER", "").strip()
-    destination_raw = os.environ["DESTINATION_BOT"].strip()
-
-    address_types = {
-        item.strip().lower()
-        for item in os.getenv("ADDRESS_TYPES", "evm,solana,sui").split(",")
-        if item.strip()
-    }
     require_keyword = os.getenv("REQUIRE_KEYWORD", "").strip().lower()
-    dry_run = os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes", "on"}
-    forward_delay_seconds = max(0.0, float(os.getenv("FORWARD_DELAY_SECONDS", "2")))
-    history_db_path = os.getenv("HISTORY_DB_PATH", "/data/forwarded_contracts.sqlite3")
+    db_path = os.getenv("HISTORY_DB_PATH", "/data/forwarded_contracts.sqlite3")
+    panel_password = os.getenv("PANEL_PASSWORD", "").strip()
+    panel_secret = os.getenv("PANEL_SECRET", "").strip()
+    port = int(os.getenv("PORT", "8080"))
 
-    db = open_history_db(history_db_path)
+    db = open_db(db_path)
+    config_lock = asyncio.Lock()
     processing_lock = asyncio.Lock()
+    runtime = {
+        "config": load_saved_config(db),
+        "source_chat_id": None,
+        "destination_entity": None,
+        "status": "starting",
+        "last_address": None,
+        "last_chain": None,
+        "last_action": None,
+        "last_event_at": None,
+        "last_error": None,
+    }
 
-    source_chat = parse_peer(source_chat_raw)
     source_sender = parse_peer(source_sender_raw) if source_sender_raw else None
-    destination = parse_peer(destination_raw)
 
     client = TelegramClient(
         StringSession(session_string),
@@ -137,11 +218,32 @@ async def main():
         retry_delay=3,
         auto_reconnect=True,
     )
-
     await client.start()
     me = await client.get_me()
-    await client.get_entity(source_chat)
-    await client.get_entity(destination)
+
+    async def resolve_runtime_config(candidate: dict):
+        source_entity = await client.get_entity(parse_peer(candidate["source_chat_raw"]))
+        destination_entity = await client.get_entity(parse_peer(candidate["destination_raw"]))
+        return get_peer_id(source_entity), destination_entity
+
+    async def apply_runtime_config(candidate: dict, persist: bool):
+        source_chat_id, destination_entity = await resolve_runtime_config(candidate)
+        async with config_lock:
+            runtime["config"] = {
+                "source_chat_raw": candidate["source_chat_raw"],
+                "destination_raw": candidate["destination_raw"],
+                "dry_run": bool(candidate["dry_run"]),
+                "forward_delay_seconds": float(candidate["forward_delay_seconds"]),
+                "address_types": set(candidate["address_types"]),
+            }
+            runtime["source_chat_id"] = source_chat_id
+            runtime["destination_entity"] = destination_entity
+            runtime["last_error"] = None
+            if persist:
+                save_config(db, runtime["config"])
+
+    await apply_runtime_config(runtime["config"], persist=False)
+    runtime["status"] = "online"
 
     log.info(
         "Logged in as %s (%s)",
@@ -149,19 +251,21 @@ async def main():
         me.id,
     )
     log.info(
-        "Listening source=%s sender=%s destination=%s address_types=%s dry_run=%s delay=%ss history=%s",
-        source_chat_raw,
-        source_sender_raw or "ANY",
-        destination_raw,
-        ",".join(sorted(address_types)),
-        dry_run,
-        forward_delay_seconds,
-        history_db_path,
+        "Listening source=%s destination=%s address_types=%s dry_run=%s delay=%ss history=%s",
+        runtime["config"]["source_chat_raw"],
+        runtime["config"]["destination_raw"],
+        ",".join(sorted(runtime["config"]["address_types"])),
+        runtime["config"]["dry_run"],
+        runtime["config"]["forward_delay_seconds"],
+        db_path,
     )
 
-    @client.on(events.NewMessage(chats=source_chat))
+    @client.on(events.NewMessage)
     async def on_new_message(event):
         try:
+            if event.chat_id != runtime["source_chat_id"]:
+                return
+
             text = event.raw_text or ""
             if not text:
                 return
@@ -181,7 +285,9 @@ async def main():
             if require_keyword and require_keyword not in text.lower():
                 return
 
-            result = extract_first_contract(text, address_types)
+            config_snapshot = runtime["config"].copy()
+            config_snapshot["address_types"] = set(runtime["config"]["address_types"])
+            result = extract_first_contract(text, config_snapshot["address_types"])
             if not result:
                 return
 
@@ -189,35 +295,179 @@ async def main():
 
             async with processing_lock:
                 if is_forwarded(db, address):
+                    runtime["last_address"] = address
+                    runtime["last_chain"] = kind
+                    runtime["last_action"] = "duplicate_ignored"
+                    runtime["last_event_at"] = datetime.now(timezone.utc).isoformat()
                     log.info("Duplicate ignored: %s", address)
                     return
 
                 log.info("Detected %s contract: %s", kind, address)
+                if config_snapshot["forward_delay_seconds"]:
+                    await asyncio.sleep(config_snapshot["forward_delay_seconds"])
 
-                if forward_delay_seconds:
-                    await asyncio.sleep(forward_delay_seconds)
+                runtime["last_address"] = address
+                runtime["last_chain"] = kind
+                runtime["last_event_at"] = datetime.now(timezone.utc).isoformat()
 
-                if dry_run:
-                    log.info("[DRY_RUN] Would send to %s: %s", destination_raw, address)
+                if config_snapshot["dry_run"]:
+                    runtime["last_action"] = "dry_run"
+                    log.info("[DRY_RUN] Would send to %s: %s", config_snapshot["destination_raw"], address)
                     return
 
+                destination_entity = runtime["destination_entity"]
                 try:
-                    sent = await client.send_message(destination, address)
+                    sent = await client.send_message(destination_entity, address)
                 except FloodWaitError as exc:
                     log.warning("Telegram FloodWait: %ss", exc.seconds)
                     await asyncio.sleep(exc.seconds + 1)
-                    sent = await client.send_message(destination, address)
+                    sent = await client.send_message(destination_entity, address)
 
                 mark_forwarded(db, kind, address)
+                runtime["last_action"] = "forwarded"
                 log.info("Forwarded successfully, message_id=%s", sent.id)
 
-        except Exception:
+        except Exception as exc:
+            runtime["last_error"] = str(exc)
+            runtime["last_action"] = "error"
+            runtime["last_event_at"] = datetime.now(timezone.utc).isoformat()
             log.exception("Error processing Telegram message")
 
+    def is_authenticated(request):
+        return bool(panel_secret) and request.cookies.get("ca_panel") == panel_secret
+
+    async def login_get(request):
+        if is_authenticated(request):
+            raise web.HTTPFound("/")
+        return web.Response(text=LOGIN_HTML.format(error=""), content_type="text/html")
+
+    async def login_post(request):
+        data = await request.post()
+        if not panel_password:
+            return web.Response(
+                text=LOGIN_HTML.format(error='<div class="err">PANEL_PASSWORD non configurata su Railway.</div>'),
+                content_type="text/html",
+                status=503,
+            )
+        if data.get("password", "") != panel_password:
+            return web.Response(
+                text=LOGIN_HTML.format(error='<div class="err">Password non corretta. Riprova 👀</div>'),
+                content_type="text/html",
+                status=401,
+            )
+        response = web.HTTPFound("/")
+        response.set_cookie(
+            "ca_panel",
+            panel_secret,
+            httponly=True,
+            secure=True,
+            samesite="Strict",
+            max_age=60 * 60 * 24 * 30,
+        )
+        return response
+
+    async def logout_post(request):
+        response = web.HTTPFound("/login")
+        response.del_cookie("ca_panel")
+        return response
+
+    async def panel_get(request):
+        if not is_authenticated(request):
+            raise web.HTTPFound("/login")
+        panel_path = Path(__file__).with_name("panel.html")
+        return web.Response(text=panel_path.read_text(encoding="utf-8"), content_type="text/html")
+
+    async def api_config_get(request):
+        if not is_authenticated(request):
+            raise web.HTTPUnauthorized()
+        cfg = runtime["config"]
+        return web.json_response({
+            "source_chat": cfg["source_chat_raw"],
+            "destination_bot": cfg["destination_raw"],
+            "dry_run": cfg["dry_run"],
+            "forward_delay_seconds": cfg["forward_delay_seconds"],
+            "address_types": sorted(cfg["address_types"]),
+            "status": runtime["status"],
+            "telegram_user": getattr(me, "username", None) or getattr(me, "first_name", "unknown"),
+            "forwarded_count": forwarded_count(db),
+            "last_address": runtime["last_address"],
+            "last_chain": runtime["last_chain"],
+            "last_action": runtime["last_action"],
+            "last_event_at": runtime["last_event_at"],
+            "last_error": runtime["last_error"],
+        })
+
+    async def api_config_post(request):
+        if not is_authenticated(request):
+            raise web.HTTPUnauthorized()
+        try:
+            payload = await request.json()
+            source_chat = str(payload.get("source_chat", "")).strip()
+            destination_bot = str(payload.get("destination_bot", "")).strip()
+            dry_run = bool(payload.get("dry_run", False))
+            delay = float(payload.get("forward_delay_seconds", 0))
+            types_raw = payload.get("address_types", [])
+            address_types = {
+                str(item).strip().lower()
+                for item in types_raw
+                if str(item).strip().lower() in ALLOWED_ADDRESS_TYPES
+            }
+
+            if not source_chat:
+                raise ValueError("Inserisci una sorgente Telegram.")
+            if not destination_bot:
+                raise ValueError("Inserisci una destinazione Telegram.")
+            if not 0 <= delay <= 30:
+                raise ValueError("Il delay deve essere compreso tra 0 e 30 secondi.")
+            if not address_types:
+                raise ValueError("Seleziona almeno un tipo di address.")
+
+            candidate = {
+                "source_chat_raw": source_chat,
+                "destination_raw": destination_bot,
+                "dry_run": dry_run,
+                "forward_delay_seconds": delay,
+                "address_types": address_types,
+            }
+
+            await apply_runtime_config(candidate, persist=True)
+            log.info(
+                "Panel config updated: source=%s destination=%s dry_run=%s delay=%s address_types=%s",
+                source_chat,
+                destination_bot,
+                dry_run,
+                delay,
+                ",".join(sorted(address_types)),
+            )
+            return web.json_response({"ok": True})
+        except Exception as exc:
+            runtime["last_error"] = str(exc)
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+    async def health_get(request):
+        return web.json_response({"ok": True, "bot": runtime["status"]})
+
+    app = web.Application(client_max_size=64 * 1024)
+    app.router.add_get("/login", login_get)
+    app.router.add_post("/login", login_post)
+    app.router.add_post("/logout", logout_post)
+    app.router.add_get("/", panel_get)
+    app.router.add_get("/api/config", api_config_get)
+    app.router.add_post("/api/config", api_config_post)
+    app.router.add_get("/health", health_get)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("Control panel listening on port %s", port)
     log.info("Userbot running")
+
     try:
         await client.run_until_disconnected()
     finally:
+        runtime["status"] = "offline"
+        await runner.cleanup()
         db.close()
 
 
