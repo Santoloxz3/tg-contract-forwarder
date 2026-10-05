@@ -1,75 +1,117 @@
-# CA Courier: controllo preventivo prima di Maestro
+# CA Courier: filtro multichain prima dell’inoltro
 
-Il listener verifica ogni CA **prima** di `send_message`. Il filtro è sempre attivo,
-anche in dry-run. Un esito `unknown`, un timeout, una risposta incompleta o un errore
-impediscono l'inoltro. Nessuna chiave privata, firma o transazione è necessaria.
+Il controllo è sempre attivo prima di inviare un CA al bot di destinazione, anche
+in dry-run. Non usa chiavi private, firme né transazioni. La configurazione viene
+salvata nel SQLite esistente, senza eliminare storico o duplicati.
 
-## Copertura e limiti
+## Modalità Bilanciata (default)
 
-- EVM: Ethereum (1), BNB Chain (56), Base (8453). In modalità automatica la rete
-  viene identificata dalle pool Dexscreener; una rete assente/ambigua viene bloccata.
-- Solana, Sui e le altre reti sono **bloccate perché non verificate**, non autorizzate
-  implicitamente. L'abilitazione del tipo di address non disabilita questo vincolo.
-- Dexscreener individua la pool e la liquidità disponibile; GoPlus controlla i rischi
-  del contratto; Honeypot.is fornisce una simulazione acquisto/vendita sulla stessa pool.
-  Non si forza una liquidità simulata e non si riutilizzano esiti positivi in cache.
-- Nessuna garanzia di profitto, di liquidità bloccata, di assenza di rug pull o di
-  vendibilità futura. Gli scanner possono sbagliare. La simulazione esterna non usa
-  il wallet dell'utente o l'importo impostato su Maestro. Non è un audit completo del codice.
-- Il token MCPAD già analizzato è inoltre nella lista locale dei contratti bloccati.
+Blocca restrizioni concrete: blacklist/congelamento, non trasferibilità, vendite
+impedite, modifiche ai saldi, tasse per wallet e commissioni note oltre soglia.
+L’assenza di un controllo **essenziale** resta `unknown` e non autorizza l’inoltro.
+Dati secondari mancanti, mint, metadati modificabili, liquidità non indicizzata e
+certi poteri amministrativi diventano avvisi, non un rifiuto automatico.
 
-## Regole
+`allowed_with_warnings` significa che i controlli essenziali disponibili sono stati
+superati con copertura e rischi residui esplicitati nel registro. Non significa
+che il token è sicuro, vendibile in futuro o profittevole.
 
-Blocchi per blacklist, whitelist, pausa trasferimenti, tasse modificabili (anche per
-wallet), saldi modificabili, mint, proxy, proprietario nascosto/recuperabile,
-autodistruzione, chiamate esterne, restrizioni di acquisto/vendita, limiti modificabili
-e cooldown. Si richiedono risposte esplicite per tutti i controlli: campi vuoti,
-mancanti o malformati non equivalgono a rischio zero. La rinuncia all'ownership non
-basta a ignorare blacklist esistenti o funzioni pubbliche malevole.
+### Solana
 
-Il filtro è deliberatamente restrittivo e può bloccare anche token legittimi che
-hanno questi poteri. `allowed` significa soltanto «controlli disponibili superati».
+- GoPlus Solana e RPC `getAccountInfo` con `jsonParsed` partono in parallelo.
+- Un risultato completo sui controlli essenziali basta; una seconda fonte già
+  disponibile può aggiungere un blocco. Non si attende una fonte lenta oltre
+  una finestra aggiuntiva di 100 ms. Le richieste residue vengono annullate.
+- La lettura nativa verifica che sia un mint inizializzato di SPL Token o Token-2022,
+  freeze authority ed estensioni. Blocchi per hook attivi, delegato permanente,
+  token non trasferibile, account congelati, pausa, commissioni modificabili,
+  possibilità di chiudere il mint e altre estensioni restrittive. Estensioni
+  sconosciute impediscono di considerare completo il controllo nativo.
+- Non richiede DEX già indicizzato, un numero minimo di holder o pool migrata.
+  Un lancio su bonding curve non viene respinto soltanto perché manca una pool.
+- Mint authority e metadati modificabili sono avvisi. In modalità Prudente la
+  mint authority è bloccante.
 
-## Pannello e persistenza
+### Sui
 
-Impostazioni salvate nel SQLite esistente:
+- GoPlus Sui verifica la blacklist/DenyCap sul tipo completo della coin.
+- `package::modulo::TOKEN` mantiene maiuscole e minuscole di modulo e tipo.
+- Un package nudo viene risolto via RPC quando individua una sola coin con witness
+  standard e metadati disponibili. Package ambigui, witness non standard o errori
+  RPC richiedono il tipo completo. Le chiamate JSON-RPC Sui sono una compatibilità
+  con i nodi che le espongono; una loro indisponibilità non autorizza a indovinare il tipo.
+- DenyCap/blacklist bloccanti; mint, upgrade e metadati sono avvisi in modalità
+  Bilanciata. Prudente blocca anche mint e upgrade e richiede i relativi esiti.
+- **Maestro non elenca Sui tra le reti supportate**: la verifica Sui è disponibile,
+  ma se la destinazione è Maestro non viene effettuato l’inoltro. Il registro
+  mostra `unsupported_destination`. Una destinazione diversa va configurata nel
+  pannello; il filtro non verifica le capacità di trading di bot terzi.
+
+### EVM
+
+- Ethereum, BNB Chain e Base. Rete esplicita consigliata quando nota: una richiesta
+  GoPlus invece di tre per identificare il token senza attendere Dexscreener.
+- In automatico si interrogano le tre reti in parallelo. Risposte ambigue o
+  identificazione incompleta non autorizzano l’inoltro.
+- GoPlus deve verificare almeno honeypot, blacklist, pausa trasferimenti, modifica
+  saldi e tasse per wallet. Segnali positivi di proxy, proprietario nascosto,
+  autodistruzione e restrizioni di acquisto/vendita sono bloccanti.
+- In Bilanciata, liquidità non indicizzata/sotto soglia, mint, whitelist e tasse
+  globali modificabili sono avvisi. Quest’ultima scelta aumenta il rischio di
+  peggioramenti delle tasse dopo l’acquisto. Non c’è simulazione obbligatoria.
+- Prudente mantiene i controlli completi GoPlus + Honeypot.is, verifica la pool e
+  impone la soglia di liquidità. Non è una simulazione del wallet/importo Maestro.
+- Il contratto MCPAD già analizzato resta sempre bloccato localmente.
+
+## Tempismo e impostazioni
 
 | Impostazione | Default | Intervallo |
 |---|---|---|
-| Rete | auto | auto, 1, 56, 8453 |
+| Modalità | Bilanciata | Bilanciata / Prudente |
+| Budget complessivo verifiche | 4 s | 1–10 s |
+| Rete EVM | auto | auto, 1, 56, 8453 |
 | Tassa massima | 10% | 0–20% |
-| Liquidità minima sulla pool | $10.000 | $1.000–$1.000.000 |
+| Soglia liquidità EVM | $10.000 | $0–$1.000.000 |
 
-Il registro contiene `security_blocked`, `security_unknown`, `security_test` e
-`stale_ignored`; ogni evento conserva il report completo in `security_json`.
-La migrazione aggiunge una colonna senza eliminare storico, impostazioni o duplicati.
-I CA bloccati non vengono marcati come inoltrati. Nessun job periodico: le richieste
-esterne avvengono solo alla ricezione di un CA nuovo o durante una verifica manuale.
+Il budget limita l’attesa, non garantisce il tempo di risposta delle API. Il delay
+tecnico già configurato è separato e si aggiunge alle verifiche. Non ci sono attese
+per indicizzazione, cache di esiti positivi o job periodici. Dopo FloodWait serve
+un nuovo controllo; messaggi in attesa da oltre 120 s o con configurazione cambiata
+vengono scartati. È possibile perdere l’occasione quando un controllo essenziale
+non risponde nel tempo assegnato: il filtro non confonde rapidità con autorizzazione
+su dati assenti.
 
-`POST /api/security/check` è autenticato come il pannello, verifica soltanto e **non
-inoltra messaggi**. Il pannello mostra gli esiti completi. Se le API limitano le
-richieste o non rispondono, il risultato resta `unknown` e il listener non invia.
+Il registro conserva esito, avvisi, copertura e durata in millisecondi quando la
+verifica termina. `POST /api/security/check` è autenticato, supporta tutte e tre le
+famiglie di reti e **non inoltra messaggi**. I CA respinti non sono marcati inoltrati.
+Le credenziali esistenti e il comando `python runner.py` restano utilizzabili.
 
-Le verifiche hanno un limite complessivo di 22 secondi; i CA in attesa da più di 120
-secondi vengono scartati. Dopo un FloodWait Telegram serve una nuova verifica.
-Una modifica della configurazione durante l'attesa annulla l'inoltro in corso.
+RPC opzionali: `SOLANA_RPC_URL` e `SUI_RPC_URL`; default pubblici di mainnet.
+Non occorrono nuove variabili per il rilascio. Le API pubbliche possono imporre
+rate limit. In modalità rapida una fonte che completa i controlli essenziali può
+bastare; una fonte lenta potrebbe quindi non essere consultata fino in fondo.
 
-## Verifica e rilascio
+## Limiti
+
+Non è un audit completo, non effettua una vendita di prova, non controlla il wallet
+utente né la dimensione dell’acquisto Maestro. Non garantisce assenza di rug pull,
+liquidità bloccata, vincoli del protocollo di lancio, slippage o profitto. Gli scanner
+possono sbagliare e il rischio può cambiare dopo il controllo. Sugli asset Sui la
+lettura dei poteri del token non verifica routing, pool o capacità del bot di trading.
+
+## Validazione e rilascio
 
 ```sh
 python -m pip install -r requirements.txt
-python -m unittest -q test_security
-python -m py_compile main.py token_security.py
+python -m unittest -q test_security test_multichain
+python -m py_compile main.py token_security.py non_evm_security.py
 ```
 
-I test usano un client Telegram finto: coprono i blocchi senza tentativi di invio,
-gli esiti incompleti, il controllo manuale, la migrazione SQLite, i duplicati,
-il dry-run, un cambio configurazione in corso e la nuova verifica dopo FloodWait.
+I test usano Telegram finto. Coprono blocchi senza invio, fallback nativo per token
+non indicizzati, timeout, estensioni restrittive, avvisi non bloccanti, case e
+ambiguità Sui, destinatario Maestro non compatibile, duplicati, dry-run e FloodWait.
+Railway segue `main`; `/health` espone `version=security-gate-v2`, reti e modalità.
+La tabella degli eventi conserva i report nella colonna `security_json`.
 
-Railway segue `main` e continua ad avviare `python runner.py`. Non occorrono nuove
-variabili né modifiche alle credenziali. `/health` espone `version=security-gate-v1`,
-`security_enabled=true` e `security_fail_closed=true` per verificare il rilascio.
-
-Rollback: ripristinare i file dal commit precedente e pubblicare il ripristino.
-Il vecchio codice ignora la colonna SQLite aggiunta; lo storico resta leggibile.
-Attenzione: il rollback rimuove il filtro e ripristina il vecchio inoltro senza controlli.
+Ripristinare un commit precedente permette il rollback senza cancellare il DB.
+Tornare a un commit privo del filtro ripristina l’inoltro senza controlli.

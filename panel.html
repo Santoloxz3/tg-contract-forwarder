@@ -46,6 +46,7 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
 .securityResult{font-size:12px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:12px;color:#bac7e7}
 .state.security_blocked,.state.security_unknown{background:rgba(255,131,150,.12);color:#ffabb8}
 .state.security_test,.state.stale_ignored{background:rgba(255,217,117,.11);color:#ffe199}
+.state.forwarded.warning,.state.unsupported_destination{background:rgba(255,217,117,.11);color:#ffe199}
 .addr details{font-size:12px;color:#bac7e7;margin-top:7px}.addr details summary{cursor:pointer;color:#8fb4ff}.addr details p{white-space:normal;overflow-wrap:anywhere;margin:8px 0}
 .history{margin-top:18px}
 .historyHead{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;margin-bottom:16px}
@@ -105,20 +106,24 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
           <label class="chip"><input type="checkbox" value="solana"><span>◎ Solana</span></label>
           <label class="chip"><input type="checkbox" value="sui"><span>💧 Sui</span></label>
         </div>
-        <div class="hint">Il bot prende il primo contract address valido. Solana e Sui restano bloccati finché non è disponibile un controllo dedicato.</div>
+        <div class="hint">Il primo CA viene controllato su EVM, Solana o Sui. Per Sui si usa il tipo completo della coin, preservando maiuscole e minuscole.</div>
       </div>
 
       <div class="securityBox">
         <h2>🛡️ Filtro antifrode attivo</h2>
-        <p class="desc">Ogni CA deve superare i controlli prima dell'inoltro. Rischi rilevati, dati mancanti o servizi indisponibili bloccano il messaggio.</p>
+        <p class="desc">Blocchi concreti e controlli essenziali mancanti impediscono l'inoltro. In modalità bilanciata, dati di mercato incompleti e rischi secondari producono avvisi.</p>
+        <div class="row">
+          <div class="field"><label for="securityMode">Modalità</label><select id="securityMode"><option value="balanced">Bilanciata — rapida, ammette avvisi</option><option value="strict">Prudente — controlli più restrittivi</option></select></div>
+          <div class="field"><label for="securityTimeout">Tempo massimo controlli (s)</label><input id="securityTimeout" type="number" min="1" max="10" step="0.5"><div class="hint">Default 4 s. Il delay tecnico è separato.</div></div>
+        </div>
         <div class="field"><label for="securityChain">Rete EVM da verificare</label>
           <select id="securityChain"><option value="auto">Automatica — blocca reti ambigue</option><option value="56">BNB Chain</option><option value="1">Ethereum</option><option value="8453">Base</option></select>
         </div>
         <div class="row">
           <div class="field"><label for="maxTax">Tassa massima (%)</label><input id="maxTax" type="number" min="0" max="20" step="0.5"><div class="hint">Acquisto, vendita e trasferimento. Default 10%.</div></div>
-          <div class="field"><label for="minLiquidity">Liquidità minima ($)</label><input id="minLiquidity" type="number" min="1000" max="1000000" step="1000"><div class="hint">Sulla pool verificata. Default $10.000.</div></div>
+          <div class="field"><label for="minLiquidity">Soglia liquidità EVM ($)</label><input id="minLiquidity" type="number" min="0" max="1000000" step="1000"><div class="hint">Bilanciata: avviso. Prudente: blocco. Nessuna soglia obbligatoria su Solana/Sui.</div></div>
         </div>
-        <div class="hint">Blacklist, whitelist, tasse modificabili, pausa trasferimenti, mint e proxy impediscono l'inoltro. Servono risposte complete di GoPlus e Honeypot.is. Il controllo riduce il rischio, ma non garantisce vendibilità futura, liquidità bloccata o profitti. Le simulazioni del servizio non sono specifiche per il tuo wallet o per l'importo Maestro.</div>
+        <div class="hint">Sempre bloccati: blacklist/congelamento, non trasferibilità, restrizioni rilevate alla vendita e tasse oltre soglia. Bilanciata: mint, metadati, pochi dati e liquidità non indicizzata diventano avvisi. Solana: scanner o lettura nativa SPL/Token-2022. Sui: blacklist/DenyCap; capacità di mint e upgrade sono avvisi. EVM rapida: GoPlus, senza simulazione obbligatoria. Nessuna garanzia di vendibilità futura o profitto. Maestro non supporta Sui: i CA Sui possono essere verificati, ma non gli vengono inoltrati.</div>
       </div>
       <button id="save" class="save">Salva configurazione 🚀</button>
     </section>
@@ -148,7 +153,8 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
       <h2>Ultimo controllo antifrode</h2><div id="lastSecurity" class="securityResult">Nessun controllo recente.</div>
       <div class="securityBox">
         <h2>Verifica un CA</h2><p class="desc">Usa la rete e le soglie salvate. Non inoltra nulla a Maestro.</p>
-        <label for="testAddress">Contract address EVM</label><input id="testAddress" type="text" placeholder="0x…" autocomplete="off">
+        <label for="testKind">Rete</label><select id="testKind"><option value="evm">EVM</option><option value="solana">Solana</option><option value="sui">Sui</option></select>
+        <label for="testAddress" style="margin-top:12px">Contract address / coin type</label><input id="testAddress" type="text" placeholder="CA o 0x…::modulo::TOKEN" autocomplete="off">
         <button class="miniBtn" id="testSecurity" style="margin-top:12px">Controlla senza inoltrare</button>
         <div id="testResult" class="securityResult" role="status" aria-live="polite"></div>
       </div>
@@ -170,11 +176,11 @@ const $=s=>document.querySelector(s);
 const $$=s=>[...document.querySelectorAll(s)];
 let dirty=false;
 const escapeHTML=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-function securityText(s){return s?({allowed:"CONTROLLI SUPERATI",blocked:"BLOCCATO",unknown:"NON VERIFICABILE"}[s.verdict]||"NON VERIFICABILE")+(s.chain_id?" • rete "+s.chain_id:"")+"\n"+(s.reasons||[]).join("\n"):"Nessun controllo recente."}
+function securityText(s){return s?({allowed:"CONTROLLI SUPERATI",allowed_with_warnings:"AMMESSO CON AVVISI",blocked:"BLOCCATO",unknown:"NON VERIFICABILE"}[s.verdict]||"NON VERIFICABILE")+(s.chain_id?" • rete "+s.chain_id:"")+(s.checks?.elapsed_ms!==undefined?" • "+s.checks.elapsed_ms+" ms":"")+"\n"+(s.reasons||[]).join("\n")+(s.warnings?.length?"\nAvvisi:\n"+s.warnings.join("\n"):""):"Nessun controllo recente."}
 const toast=(msg,ok=true)=>{const t=$("#toast");t.textContent=msg;t.className="toast show "+(ok?"ok":"bad");setTimeout(()=>t.className="toast",2600)};
 
 function actionLabel(a){
-  return ({forwarded:"INOLTRATO",dry_run:"DRY RUN",duplicate_ignored:"DUPLICATO",error:"ERRORE",security_blocked:"BLOCCATO",security_unknown:"NON VERIFICABILE",security_test:"VERIFICA MANUALE",stale_ignored:"SCADUTO"}[a]||"IN ASCOLTO");
+  return ({forwarded:"INOLTRATO",dry_run:"DRY RUN",duplicate_ignored:"DUPLICATO",error:"ERRORE",security_blocked:"BLOCCATO",security_unknown:"NON VERIFICABILE",security_test:"VERIFICA MANUALE",stale_ignored:"SCADUTO",unsupported_destination:"DEST. NON SUPPORTATA"}[a]||"IN ASCOLTO");
 }
 function chainLabel(c){
   return ({evm:"⟠ EVM",solana:"◎ SOL",sui:"💧 SUI"}[c]||String(c||"—").toUpperCase());
@@ -187,6 +193,8 @@ function render(d){
   $("#delay").value=d.forward_delay_seconds ?? 2;
   $$(".chip input").forEach(x=>x.checked=(d.address_types||[]).includes(x.value));
   $("#securityChain").value=d.security_chain||"auto";
+  $("#securityMode").value=d.security_mode||"balanced";
+  $("#securityTimeout").value=d.security_timeout_seconds??4;
   $("#maxTax").value=d.security_max_tax_pct??10;
   $("#minLiquidity").value=d.security_min_liquidity_usd??10000;
   }
@@ -198,6 +206,7 @@ function render(d){
   $("#flowDest").textContent=d.destination_bot||"—";
   $("#lastAddress").textContent=d.last_address||"Nessun evento recente";
   $("#lastBadge").textContent=actionLabel(d.last_action);
+  if(d.last_action==="forwarded"&&d.last_security?.verdict==="allowed_with_warnings") $("#lastBadge").textContent="INOLTRATO · AVVISI";
   if(d.last_error) $("#lastBadge").textContent="ERRORE";
   $("#lastSecurity").textContent=securityText(d.last_security);
 }
@@ -220,7 +229,7 @@ function renderHistory(events){
         <small>${escapeHTML(e.source_chat||"—")} → ${escapeHTML(e.destination_bot||"—")}${e.detail?" • "+escapeHTML(e.detail):""}</small>
         ${e.security?`<details><summary>Dettagli controllo</summary><p>${escapeHTML(securityText(e.security)).replace(/\n/g,"<br>")}</p></details>`:""}
       </div>
-      <div class="state ${escapeHTML(e.action||"error")}">${escapeHTML(actionLabel(e.action))}</div>
+      <div class="state ${escapeHTML(e.action||"error")}${e.action==="forwarded"&&e.security?.warnings?.length?" warning":""}">${escapeHTML(e.action==="forwarded"&&e.security?.warnings?.length?"INOLTRATO · AVVISI":actionLabel(e.action))}</div>
     </div>
   `).join("");
 }
@@ -248,6 +257,8 @@ $("#save").addEventListener("click",async()=>{
       forward_delay_seconds:Number($("#delay").value),
       address_types:$$(".chip input:checked").map(x=>x.value),
       security_chain:$("#securityChain").value,
+      security_mode:$("#securityMode").value,
+      security_timeout_seconds:Number($("#securityTimeout").value),
       security_max_tax_pct:Number($("#maxTax").value),
       security_min_liquidity_usd:Number($("#minLiquidity").value)
     };
@@ -265,7 +276,7 @@ $("#testSecurity").addEventListener("click",async()=>{
   const b=$("#testSecurity");b.disabled=true;
   $("#testResult").textContent="Verifica in corso…";
   try{
-    const r=await fetch("/api/security/check",{method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",body:JSON.stringify({address:$("#testAddress").value.trim(),kind:"evm"})});
+    const r=await fetch("/api/security/check",{method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",body:JSON.stringify({address:$("#testAddress").value.trim(),kind:$("#testKind").value})});
     if(r.status===401){location.href="/login";return}
     const d=await r.json();if(!r.ok) throw new Error(d.error||"Verifica non disponibile");
     $("#testResult").textContent=securityText(d);await loadHistory();

@@ -1,6 +1,7 @@
 """Read-only, fail-closed screening. Passing is not a guarantee of future sellability."""
 import asyncio
 import math
+import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -31,7 +32,8 @@ RISK_FLAGS = {
     "anti_whale_modifiable": "Limiti di transazione modificabili",
 }
 DEFAULT_SETTINGS = {"security_chain": "auto", "security_max_tax_pct": 10.0,
-                    "security_min_liquidity_usd": 10000.0}
+                    "security_min_liquidity_usd": 10000.0,
+                    "security_mode": "balanced", "security_timeout_seconds": 4.0}
 
 
 def number(value):
@@ -49,8 +51,11 @@ def validate_settings(raw):
     settings["security_chain"] = str(settings["security_chain"])
     if settings["security_chain"] not in {"auto", *CHAINS}:
         raise ValueError("Rete antifrode non supportata.")
+    if settings["security_mode"] not in {"balanced", "strict"}:
+        raise ValueError("Modalità antifrode non valida.")
     for key, low, high in [("security_max_tax_pct", 0, 20),
-                           ("security_min_liquidity_usd", 1000, 1000000)]:
+                           ("security_min_liquidity_usd", 0, 1000000),
+                           ("security_timeout_seconds", 1, 10)]:
         value = number(settings[key])
         if value is None or not low <= value <= high:
             raise ValueError(f"Valore {key} fuori intervallo: {low}–{high}.")
@@ -65,12 +70,13 @@ class SecurityResult:
     chain_id: str | None = None
     pair: str | None = None
     checks: dict = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
     checked_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     checked_monotonic: float = field(default_factory=time.monotonic, repr=False)
 
     @property
     def allowed(self):
-        return self.verdict == "allowed"
+        return self.verdict in {"allowed", "allowed_with_warnings"}
 
     def public(self):
         result = asdict(self)
@@ -78,7 +84,7 @@ class SecurityResult:
         return result
 
     def detail(self):
-        return "; ".join(self.reasons)
+        return "; ".join(self.reasons + self.warnings)
 
 
 def evaluate_goplus(token, max_tax):
@@ -167,20 +173,89 @@ class TokenSecurity:
             return json.loads(body)
 
     async def check(self, kind, address, settings):
-        if kind != "evm":
-            return SecurityResult("unknown", [f"Controllo {kind} non ancora disponibile: inoltro bloccato"])
-        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+        started = time.monotonic()
+        if kind not in {"evm", "solana", "sui"}:
+            return SecurityResult("unknown", ["Rete non supportata"])
+        if kind == "evm" and not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
             return SecurityResult("unknown", ["Indirizzo EVM non valido"])
-        address = address.lower()
+        address = address.lower() if kind == "evm" else address
         if address in KNOWN_BLOCKED:
             return SecurityResult("blocked", ["MCPAD: contratto con blocchi malevoli già verificati"])
         try:
             settings = validate_settings(settings)
-            async with asyncio.timeout(22):
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                    return await self._check_evm(session, address, settings)
+            async with asyncio.timeout(settings["security_timeout_seconds"]):
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=settings["security_timeout_seconds"]), trust_env=True) as session:
+                    if kind != "evm":
+                        from non_evm_security import check_non_evm
+                        result = await check_non_evm(self, session, kind, address, settings)
+                    elif settings["security_mode"] == "balanced":
+                        result = await self._check_evm_balanced(session, address, settings)
+                    else:
+                        result = await self._check_evm(session, address, settings)
+                    result.checks["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+                    return result
         except (TimeoutError, aiohttp.ClientError, ValueError, TypeError, KeyError, AttributeError):
             return SecurityResult("unknown", ["Verifica incompleta / API indisponibile: inoltro bloccato"])
+
+    async def _rpc(self, session, url, method, params):
+        async with session.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}) as response:
+            if response.status != 200:
+                raise ValueError(f"RPC HTTP {response.status}")
+            data = await response.json()
+            if not isinstance(data, dict) or "error" in data or "result" not in data:
+                raise ValueError("RPC: risposta non valida")
+            return data["result"]
+
+    async def _check_evm_balanced(self, session, address, settings):
+        from non_evm_security import finish
+        chain = settings["security_chain"]
+        candidates = list(CHAINS) if chain == "auto" else [chain]
+        market = asyncio.create_task(self._get(session, f"https://api.dexscreener.com/latest/dex/tokens/{address}"))
+        try:
+            scans = await asyncio.gather(*(self._get(session, f"https://api.gopluslabs.io/api/v1/token_security/{c}",
+                                                   {"contract_addresses": address}) for c in candidates), return_exceptions=True)
+            found = [(c, (d.get("result") or {}).get(address)) for c, d in zip(candidates, scans)
+                     if isinstance(d, dict) and d.get("code") == 1 and (d.get("result") or {}).get(address)]
+            if len(found) != 1:
+                return SecurityResult("unknown", ["Rete/token assente o ambiguo; scegli una rete EVM nel pannello"])
+            chain, token = found[0]
+            if len(candidates) > 1 and any(isinstance(d, Exception) or not isinstance(d, dict) or d.get("code") != 1 for d in scans):
+                return SecurityResult("unknown", ["Identificazione rete incompleta; scegli una rete EVM esplicita"], chain)
+            blocked, unknown, warnings = [], [], []
+            core = {"is_honeypot", "is_blacklisted", "transfer_pausable", "owner_change_balance", "personal_slippage_modifiable"}
+            hard = core | {"cannot_sell_all", "cannot_buy", "is_proxy", "hidden_owner", "selfdestruct"}
+            for key, label in RISK_FLAGS.items():
+                value = token.get(key)
+                if value == "1":
+                    (blocked if key in hard else warnings).append(label)
+                elif value != "0":
+                    (unknown if key in core else warnings).append(f"GoPlus: {key} non verificato")
+            for key in ("buy_tax", "sell_tax", "transfer_tax"):
+                tax = number(token.get(key))
+                if tax is None:
+                    warnings.append(f"{key} non ancora disponibile")
+                elif tax * 100 > settings["security_max_tax_pct"]:
+                    blocked.append(f"{key} {tax * 100:.2f}% oltre soglia")
+            if token.get("is_open_source") != "1":
+                warnings.append("Codice non verificato / indicizzazione incompleta: nessun audit del codice")
+            pairs = []
+            if market.done() and not market.cancelled():
+                try:
+                    pairs = (market.result().get("pairs") or [])
+                except Exception:
+                    pass
+            pairs = [p for p in pairs if p.get("chainId") == CHAINS[chain] and
+                     str((p.get("baseToken") or {}).get("address", "")).lower() == address]
+            liquidity = max((number((p.get("liquidity") or {}).get("usd")) or 0 for p in pairs), default=None)
+            if liquidity is None:
+                warnings.append("Pool/liquidità non indicizzate: possibile lancio recente")
+            elif liquidity < settings["security_min_liquidity_usd"]:
+                warnings.append(f"Liquidità ${liquidity:,.0f} sotto soglia di avviso")
+            warnings.append("Modalità rapida: nessuna simulazione acquisto/vendita; importo Maestro non verificato")
+            return finish(blocked, unknown, warnings, chain, {"goplus": {k: token.get(k) for k in RISK_FLAGS}, "liquidity_usd": liquidity})
+        finally:
+            market.cancel()
+            await asyncio.gather(market, return_exceptions=True)
 
     async def _check_evm(self, session, address, settings):
         chain_id = settings["security_chain"]

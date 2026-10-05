@@ -14,6 +14,7 @@ from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
 
 from token_security import DEFAULT_SETTINGS, TokenSecurity, validate_settings
+from non_evm_security import canonical_sui
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -30,13 +31,13 @@ REQUIRED_VARS = [
 ]
 
 PATTERNS = {
-    "sui": re.compile(r"(?<![0-9a-fA-F])0x[a-fA-F0-9]{64}(?![0-9a-fA-F])"),
+    "sui": re.compile(r"(?<![0-9a-fA-F])(?:0x[a-fA-F0-9]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*|0x[a-fA-F0-9]{64})(?![0-9a-fA-F])"),
     "evm": re.compile(r"(?<![0-9a-fA-F])0x[a-fA-F0-9]{40}(?![0-9a-fA-F])"),
     "solana": re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])"),
 }
 ALLOWED_ADDRESS_TYPES = {"evm", "solana", "sui"}
 ALLOWED_EVENT_ACTIONS = {"forwarded", "duplicate_ignored", "dry_run", "error",
-                         "security_blocked", "security_unknown", "security_test", "stale_ignored"}
+                         "security_blocked", "security_unknown", "security_test", "stale_ignored", "unsupported_destination"}
 
 
 def parse_peer(value: str):
@@ -47,6 +48,8 @@ def parse_peer(value: str):
 
 
 def normalize_address(address: str) -> str:
+    if "::" in address:
+        return canonical_sui(address) or address
     return address.lower() if address.startswith("0x") else address
 
 
@@ -444,6 +447,21 @@ async def main():
                     record_stale()
                     return
 
+                detected_address = address
+                address = security_report.checks.get("forward_address", address)
+                runtime["last_address"] = address
+                if is_forwarded(db, address):
+                    runtime["last_action"] = "duplicate_ignored"
+                    add_event(db, "duplicate_ignored", kind, address, config_snapshot["source_chat_raw"],
+                              config_snapshot["destination_raw"])
+                    return
+                if kind == "sui" and config_snapshot["destination_raw"].lstrip("@").lower().startswith("maestro"):
+                    runtime["last_action"] = "unsupported_destination"
+                    add_event(db, "unsupported_destination", kind, address, config_snapshot["source_chat_raw"],
+                              config_snapshot["destination_raw"], "Maestro non supporta Sui: nessun inoltro",
+                              security_report.public())
+                    return
+
                 if config_snapshot["dry_run"]:
                     runtime["last_action"] = "dry_run"
                     add_event(
@@ -481,6 +499,8 @@ async def main():
                     sent = await client.send_message(destination_entity_snapshot, address)
 
                 mark_forwarded(db, kind, address)
+                if detected_address != address:
+                    mark_forwarded(db, kind, detected_address)
                 add_event(
                     db,
                     "forwarded",
@@ -660,7 +680,7 @@ async def main():
                 payload = await request.json()
                 address = str(payload.get("address", "")).strip()
                 kind = str(payload.get("kind", "evm"))
-                if len(address) > 100 or kind not in ALLOWED_ADDRESS_TYPES:
+                if len(address) > 512 or kind not in ALLOWED_ADDRESS_TYPES:
                     raise ValueError("Indirizzo o tipo non valido")
                 cfg = runtime["config"].copy()
                 report = await security_guard.check(kind, address, cfg)
@@ -672,8 +692,10 @@ async def main():
 
     async def health_get(request):
         return web.json_response({"ok": True, "bot": runtime["status"],
-                                  "version": "security-gate-v1", "security_enabled": True,
-                                  "security_fail_closed": True})
+                                  "version": "security-gate-v2", "security_enabled": True,
+                                  "security_fail_closed": True,
+                                  "security_mode": runtime["config"]["security_mode"],
+                                  "security_chains": ["evm", "solana", "sui"]})
 
     app = web.Application(client_max_size=64 * 1024)
     app.router.add_get("/login", login_get)

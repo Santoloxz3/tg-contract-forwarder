@@ -71,7 +71,7 @@ class RulesTest(unittest.TestCase):
             self.assertTrue(evaluate_honeypot(d, CA, "56", PAIR, 10)[1])
 
     def test_settings_cannot_disable_filter_or_use_invalid_numbers(self):
-        for raw in [{"security_max_tax_pct": "nan"}, {"security_min_liquidity_usd": 0},
+        for raw in [{"security_max_tax_pct": "nan"}, {"security_min_liquidity_usd": -1},
                     {"security_max_tax_pct": 100}, {"security_chain": "137"}]:
             with self.assertRaises(ValueError):
                 validate_settings(raw)
@@ -131,7 +131,7 @@ class ProvidersTest(unittest.IsolatedAsyncioTestCase):
                 raise value
             return value
         with patch.object(guard, "_get", side_effect=get):
-            return await guard.check("evm", CA, DEFAULT_SETTINGS)
+            return await guard.check("evm", CA, {**DEFAULT_SETTINGS, "security_mode": "strict"})
 
     async def test_complete_reports_allow(self):
         self.assertTrue((await self.run_check()).allowed)
@@ -251,7 +251,8 @@ class BotIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_known_scam_and_unsupported_chain_do_not_send(self):
         await self.event(next(iter(KNOWN_BLOCKED)))
-        await self.event("0x" + "1" * 64)
+        with patch.object(TokenSecurity, "_rpc", new=AsyncMock(return_value={})):
+            await self.event("0x" + "1" * 64)
         self.assertEqual(self.client.attempts, 0)
 
     async def test_floodwait_requires_new_security_check(self):
