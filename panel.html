@@ -28,7 +28,7 @@ h1{font-size:24px;margin:0;letter-spacing:-.02em}.brand p{margin:4px 0 0;color:v
 .card h2{font-size:16px;margin:0 0 5px}.desc{margin:0 0 20px;color:var(--muted);font-size:13px;line-height:1.5}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:14px}.field{margin-bottom:16px}
 label{display:block;font-size:12px;color:#b7c1df;margin:0 0 8px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}
-input[type=text],input[type=number]{width:100%;background:#0c1327;border:1px solid #2e3a61;color:#fff;border-radius:14px;padding:14px 14px;outline:none}
+input[type=text],input[type=number],select{width:100%;background:#0c1327;border:1px solid #2e3a61;color:#fff;border-radius:14px;padding:14px 14px;outline:none}
 input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11)}
 .hint{font-size:11px;color:#6f7ca5;margin-top:7px}
 .switchline{display:flex;align-items:center;justify-content:space-between;gap:14px;background:#0d1529;border:1px solid var(--line);border-radius:16px;padding:14px 15px;margin:5px 0 18px}
@@ -41,6 +41,12 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
 .flow{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:8px;margin:17px 0}.node{background:#0c1327;border:1px solid var(--line);padding:13px;border-radius:15px;min-width:0}.node b{display:block;font-size:12px;color:#dfe5ff}.node span{display:block;color:#8491b7;font-size:11px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.arrow{color:#8399ff;font-size:20px}
 .last{background:linear-gradient(135deg,rgba(80,101,194,.13),rgba(157,93,192,.11));border:1px solid rgba(139,154,255,.16);border-radius:17px;padding:14px}.last .cap{font-size:11px;color:#8e9bc1;text-transform:uppercase;font-weight:800}.last code{display:block;margin-top:7px;font-size:12px;color:#dfe6ff;word-break:break-all}.badge{display:inline-flex;margin-top:10px;padding:6px 9px;border-radius:999px;font-size:11px;font-weight:850;background:rgba(102,230,174,.1);color:#89efc0}
 .notice{margin-top:12px;font-size:12px;color:#8290b5;line-height:1.45}
+.securityBox{border:1px solid rgba(102,230,174,.25);border-radius:17px;padding:16px;margin:18px 0;background:rgba(102,230,174,.035)}
+.securityBox h2{color:var(--green)}.securityBox .hint{color:var(--muted);line-height:1.5}
+.securityResult{font-size:12px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:12px;color:#bac7e7}
+.state.security_blocked,.state.security_unknown{background:rgba(255,131,150,.12);color:#ffabb8}
+.state.security_test,.state.stale_ignored{background:rgba(255,217,117,.11);color:#ffe199}
+.addr details{font-size:12px;color:#bac7e7;margin-top:7px}.addr details summary{cursor:pointer;color:#8fb4ff}.addr details p{white-space:normal;overflow-wrap:anywhere;margin:8px 0}
 .history{margin-top:18px}
 .historyHead{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;margin-bottom:16px}
 .historyHead .desc{margin:4px 0 0}
@@ -99,9 +105,21 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
           <label class="chip"><input type="checkbox" value="solana"><span>◎ Solana</span></label>
           <label class="chip"><input type="checkbox" value="sui"><span>💧 Sui</span></label>
         </div>
-        <div class="hint">Il bot prende il primo contract address valido trovato nel messaggio.</div>
+        <div class="hint">Il bot prende il primo contract address valido. Solana e Sui restano bloccati finché non è disponibile un controllo dedicato.</div>
       </div>
 
+      <div class="securityBox">
+        <h2>🛡️ Filtro antifrode attivo</h2>
+        <p class="desc">Ogni CA deve superare i controlli prima dell'inoltro. Rischi rilevati, dati mancanti o servizi indisponibili bloccano il messaggio.</p>
+        <div class="field"><label for="securityChain">Rete EVM da verificare</label>
+          <select id="securityChain"><option value="auto">Automatica — blocca reti ambigue</option><option value="56">BNB Chain</option><option value="1">Ethereum</option><option value="8453">Base</option></select>
+        </div>
+        <div class="row">
+          <div class="field"><label for="maxTax">Tassa massima (%)</label><input id="maxTax" type="number" min="0" max="20" step="0.5"><div class="hint">Acquisto, vendita e trasferimento. Default 10%.</div></div>
+          <div class="field"><label for="minLiquidity">Liquidità minima ($)</label><input id="minLiquidity" type="number" min="1000" max="1000000" step="1000"><div class="hint">Sulla pool verificata. Default $10.000.</div></div>
+        </div>
+        <div class="hint">Blacklist, whitelist, tasse modificabili, pausa trasferimenti, mint e proxy impediscono l'inoltro. Servono risposte complete di GoPlus e Honeypot.is. Il controllo riduce il rischio, ma non garantisce vendibilità futura, liquidità bloccata o profitti. Le simulazioni del servizio non sono specifiche per il tuo wallet o per l'importo Maestro.</div>
+      </div>
       <button id="save" class="save">Salva configurazione 🚀</button>
     </section>
 
@@ -127,12 +145,19 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
       </div>
 
       <p class="notice">🛡️ Lo storico anti-duplicato è persistente: un CA già inoltrato non viene inoltrato di nuovo dopo un riavvio o un deploy.</p>
+      <h2>Ultimo controllo antifrode</h2><div id="lastSecurity" class="securityResult">Nessun controllo recente.</div>
+      <div class="securityBox">
+        <h2>Verifica un CA</h2><p class="desc">Usa la rete e le soglie salvate. Non inoltra nulla a Maestro.</p>
+        <label for="testAddress">Contract address EVM</label><input id="testAddress" type="text" placeholder="0x…" autocomplete="off">
+        <button class="miniBtn" id="testSecurity" style="margin-top:12px">Controlla senza inoltrare</button>
+        <div id="testResult" class="securityResult" role="status" aria-live="polite"></div>
+      </div>
     </aside>
   </main>
 
   <section class="card history">
     <div class="historyHead">
-      <div><h2>Registro CA 📬</h2><p class="desc">Ultimi eventi intercettati dal corriere: inoltri, duplicati, dry-run ed errori.</p></div>
+      <div><h2>Registro CA 📬</h2><p class="desc">Inoltri, blocchi antifrode, verifiche, duplicati, dry-run ed errori. Apri i dettagli per leggere tutti i motivi.</p></div>
       <div class="historyTools"><button class="miniBtn" id="refreshHistory">Aggiorna ↻</button></div>
     </div>
     <div id="eventList" class="eventList"><div class="empty">Nessun evento registrato.</div></div>
@@ -143,20 +168,28 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
 <script>
 const $=s=>document.querySelector(s);
 const $$=s=>[...document.querySelectorAll(s)];
+let dirty=false;
+const escapeHTML=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function securityText(s){return s?({allowed:"CONTROLLI SUPERATI",blocked:"BLOCCATO",unknown:"NON VERIFICABILE"}[s.verdict]||"NON VERIFICABILE")+(s.chain_id?" • rete "+s.chain_id:"")+"\n"+(s.reasons||[]).join("\n"):"Nessun controllo recente."}
 const toast=(msg,ok=true)=>{const t=$("#toast");t.textContent=msg;t.className="toast show "+(ok?"ok":"bad");setTimeout(()=>t.className="toast",2600)};
 
 function actionLabel(a){
-  return ({forwarded:"INOLTRATO",dry_run:"DRY RUN",duplicate_ignored:"DUPLICATO",error:"ERRORE"}[a]||"IN ASCOLTO");
+  return ({forwarded:"INOLTRATO",dry_run:"DRY RUN",duplicate_ignored:"DUPLICATO",error:"ERRORE",security_blocked:"BLOCCATO",security_unknown:"NON VERIFICABILE",security_test:"VERIFICA MANUALE",stale_ignored:"SCADUTO"}[a]||"IN ASCOLTO");
 }
 function chainLabel(c){
   return ({evm:"⟠ EVM",solana:"◎ SOL",sui:"💧 SUI"}[c]||String(c||"—").toUpperCase());
 }
 function render(d){
+  if(!dirty){
   $("#source").value=d.source_chat||"";
   $("#destination").value=d.destination_bot||"";
   $("#dry").checked=!!d.dry_run;
   $("#delay").value=d.forward_delay_seconds ?? 2;
   $$(".chip input").forEach(x=>x.checked=(d.address_types||[]).includes(x.value));
+  $("#securityChain").value=d.security_chain||"auto";
+  $("#maxTax").value=d.security_max_tax_pct??10;
+  $("#minLiquidity").value=d.security_min_liquidity_usd??10000;
+  }
   $("#status").textContent=d.status==="online"?"Bot online":"Bot "+d.status;
   $("#tguser").textContent=d.telegram_user?"• @"+d.telegram_user:"";
   $("#count").textContent=d.forwarded_count ?? 0;
@@ -166,6 +199,7 @@ function render(d){
   $("#lastAddress").textContent=d.last_address||"Nessun evento recente";
   $("#lastBadge").textContent=actionLabel(d.last_action);
   if(d.last_error) $("#lastBadge").textContent="ERRORE";
+  $("#lastSecurity").textContent=securityText(d.last_security);
 }
 function fmtTime(v){
   if(!v) return "—";
@@ -179,13 +213,14 @@ function renderHistory(events){
   if(!events||!events.length){box.innerHTML='<div class="empty">Nessun evento registrato per ora. Il corriere è in ascolto 👂</div>';return}
   box.innerHTML=events.map(e=>`
     <div class="event">
-      <div class="eventTime">${fmtTime(e.event_at)}</div>
-      <div class="chain ${e.chain_type||""}">${chainLabel(e.chain_type)}</div>
+      <div class="eventTime">${escapeHTML(fmtTime(e.event_at))}</div>
+      <div class="chain ${escapeHTML(e.chain_type||"")}">${escapeHTML(chainLabel(e.chain_type))}</div>
       <div class="addr">
-        <code title="${e.address||""}">${e.address||"—"}</code>
-        <small>${e.source_chat||"—"} → ${e.destination_bot||"—"}${e.detail?" • "+e.detail:""}</small>
+        <code title="${escapeHTML(e.address||"")}">${escapeHTML(e.address||"—")}</code>
+        <small>${escapeHTML(e.source_chat||"—")} → ${escapeHTML(e.destination_bot||"—")}${e.detail?" • "+escapeHTML(e.detail):""}</small>
+        ${e.security?`<details><summary>Dettagli controllo</summary><p>${escapeHTML(securityText(e.security)).replace(/\n/g,"<br>")}</p></details>`:""}
       </div>
-      <div class="state ${e.action||"error"}">${actionLabel(e.action)}</div>
+      <div class="state ${escapeHTML(e.action||"error")}">${escapeHTML(actionLabel(e.action))}</div>
     </div>
   `).join("");
 }
@@ -211,15 +246,31 @@ $("#save").addEventListener("click",async()=>{
       destination_bot:$("#destination").value.trim(),
       dry_run:$("#dry").checked,
       forward_delay_seconds:Number($("#delay").value),
-      address_types:$$(".chip input:checked").map(x=>x.value)
+      address_types:$$(".chip input:checked").map(x=>x.value),
+      security_chain:$("#securityChain").value,
+      security_max_tax_pct:Number($("#maxTax").value),
+      security_min_liquidity_usd:Number($("#minLiquidity").value)
     };
     const r=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",body:JSON.stringify(payload)});
     const d=await r.json();
     if(!r.ok||!d.ok) throw new Error(d.error||"Errore nel salvataggio");
     toast("Configurazione aggiornata ✨");
+    dirty=false;
     await load();
   }catch(e){toast(e.message,false)}
   finally{b.disabled=false;b.textContent="Salva configurazione 🚀"}
+});
+$$('main section input,main section select').forEach(x=>x.addEventListener('input',()=>{dirty=true}));
+$("#testSecurity").addEventListener("click",async()=>{
+  const b=$("#testSecurity");b.disabled=true;
+  $("#testResult").textContent="Verifica in corso…";
+  try{
+    const r=await fetch("/api/security/check",{method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",body:JSON.stringify({address:$("#testAddress").value.trim(),kind:"evm"})});
+    if(r.status===401){location.href="/login";return}
+    const d=await r.json();if(!r.ok) throw new Error(d.error||"Verifica non disponibile");
+    $("#testResult").textContent=securityText(d);await loadHistory();
+  }catch(e){$("#testResult").textContent=e.message}
+  finally{b.disabled=false}
 });
 $("#refreshHistory").addEventListener("click",()=>loadHistory().catch(e=>toast(e.message,false)));
 Promise.all([load(),loadHistory()]).catch(e=>toast(e.message,false));

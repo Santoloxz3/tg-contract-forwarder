@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -11,6 +12,8 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
+
+from token_security import DEFAULT_SETTINGS, TokenSecurity, validate_settings
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -32,7 +35,8 @@ PATTERNS = {
     "solana": re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])"),
 }
 ALLOWED_ADDRESS_TYPES = {"evm", "solana", "sui"}
-ALLOWED_EVENT_ACTIONS = {"forwarded", "duplicate_ignored", "dry_run", "error"}
+ALLOWED_EVENT_ACTIONS = {"forwarded", "duplicate_ignored", "dry_run", "error",
+                         "security_blocked", "security_unknown", "security_test", "stale_ignored"}
 
 
 def parse_peer(value: str):
@@ -95,6 +99,9 @@ def open_db(path: str):
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_ca_events_event_at ON ca_events(event_at DESC, id DESC)"
     )
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(ca_events)")}
+    if "security_json" not in columns:
+        connection.execute("ALTER TABLE ca_events ADD COLUMN security_json TEXT")
     connection.commit()
     return connection
 
@@ -123,6 +130,8 @@ def save_config(db, config: dict):
     setting_set(db, "dry_run", "true" if config["dry_run"] else "false")
     setting_set(db, "forward_delay_seconds", str(config["forward_delay_seconds"]))
     setting_set(db, "address_types", ",".join(sorted(config["address_types"])))
+    for key in DEFAULT_SETTINGS:
+        setting_set(db, key, str(config[key]))
     db.commit()
 
 
@@ -144,12 +153,15 @@ def load_saved_config(db) -> dict:
     except ValueError:
         delay = 2.0
 
+    security_settings = validate_settings({key: setting_get(db, key, str(value))
+                                           for key, value in DEFAULT_SETTINGS.items()})
     return {
         "source_chat_raw": setting_get(db, "source_chat", os.environ["SOURCE_CHAT"]).strip(),
         "destination_raw": setting_get(db, "destination_bot", os.environ["DESTINATION_BOT"]).strip(),
         "dry_run": dry_raw.lower() in {"1", "true", "yes", "on"},
         "forward_delay_seconds": delay,
         "address_types": address_types,
+        **security_settings,
     }
 
 
@@ -182,13 +194,14 @@ def add_event(
     source_chat: str,
     destination_bot: str,
     detail: str | None = None,
+    security: dict | None = None,
 ):
     if action not in ALLOWED_EVENT_ACTIONS:
         action = "error"
     db.execute(
         """
-        INSERT INTO ca_events(chain_type, address, action, detail, source_chat, destination_bot)
-        VALUES(?, ?, ?, ?, ?, ?)
+        INSERT INTO ca_events(chain_type, address, action, detail, source_chat, destination_bot, security_json)
+        VALUES(?, ?, ?, ?, ?, ?, ?)
         """,
         (
             kind,
@@ -197,6 +210,7 @@ def add_event(
             detail[:500] if detail else None,
             source_chat,
             destination_bot,
+            json.dumps(security, ensure_ascii=False) if security else None,
         ),
     )
     db.commit()
@@ -206,14 +220,33 @@ def recent_events(db, limit: int = 50):
     limit = max(1, min(200, int(limit)))
     rows = db.execute(
         """
-        SELECT id, event_at, chain_type, address, action, detail, source_chat, destination_bot
+        SELECT id, event_at, chain_type, address, action, detail, source_chat, destination_bot, security_json
         FROM ca_events
         ORDER BY id DESC
         LIMIT ?
         """,
         (limit,),
     ).fetchall()
-    return [dict(row) for row in rows]
+    events = []
+    for row in rows:
+        item = dict(row)
+        raw = item.pop("security_json")
+        item["security"] = json.loads(raw) if raw else None
+        events.append(item)
+    return events
+
+
+async def screen_contract(db, guard, runtime, config, kind, address):
+    """The only pre-send gate; unknown results never authorize a send."""
+    report = await guard.check(kind, address, config)
+    runtime["last_security"] = report.public()
+    if not report.allowed:
+        action = "security_blocked" if report.verdict == "blocked" else "security_unknown"
+        runtime["last_action"] = action
+        add_event(db, action, kind, address, config["source_chat_raw"],
+                  config["destination_raw"], report.detail(), report.public())
+        log.warning("Security prevented forwarding %s: %s", address, report.detail())
+    return report
 
 
 def extract_first_contract(text: str, enabled_types: set[str]):
@@ -256,6 +289,8 @@ async def main():
     db = open_db(db_path)
     config_lock = asyncio.Lock()
     processing_lock = asyncio.Lock()
+    security_test_lock = asyncio.Lock()
+    security_guard = TokenSecurity()
     runtime = {
         "config": load_saved_config(db),
         "source_chat_id": None,
@@ -266,6 +301,8 @@ async def main():
         "last_action": None,
         "last_event_at": None,
         "last_error": None,
+        "last_security": None,
+        "config_revision": 0,
     }
 
     source_sender = parse_peer(source_sender_raw) if source_sender_raw else None
@@ -295,10 +332,12 @@ async def main():
                 "dry_run": bool(candidate["dry_run"]),
                 "forward_delay_seconds": float(candidate["forward_delay_seconds"]),
                 "address_types": set(candidate["address_types"]),
+                **validate_settings(candidate),
             }
             runtime["source_chat_id"] = source_chat_id
             runtime["destination_entity"] = destination_entity
             runtime["last_error"] = None
+            runtime["config_revision"] += 1
             if persist:
                 save_config(db, runtime["config"])
 
@@ -349,6 +388,8 @@ async def main():
                 return
 
             config_snapshot = runtime["config"].copy()
+            revision_snapshot = runtime["config_revision"]
+            received_at = asyncio.get_running_loop().time()
             config_snapshot["address_types"] = set(runtime["config"]["address_types"])
             destination_entity_snapshot = runtime["destination_entity"]
 
@@ -363,6 +404,8 @@ async def main():
                 runtime["last_address"] = address
                 runtime["last_chain"] = kind
                 runtime["last_event_at"] = now
+                runtime["last_error"] = None
+                runtime["last_security"] = None
 
                 if is_forwarded(db, address):
                     runtime["last_action"] = "duplicate_ignored"
@@ -381,6 +424,26 @@ async def main():
                 if config_snapshot["forward_delay_seconds"]:
                     await asyncio.sleep(config_snapshot["forward_delay_seconds"])
 
+                def still_current():
+                    return (revision_snapshot == runtime["config_revision"] and
+                            asyncio.get_running_loop().time() - received_at <= 120)
+
+                def record_stale():
+                    runtime["last_action"] = "stale_ignored"
+                    add_event(db, "stale_ignored", kind, address,
+                              config_snapshot["source_chat_raw"], config_snapshot["destination_raw"],
+                              "Configurazione cambiata o messaggio in attesa da oltre 120 secondi")
+
+                if not still_current():
+                    record_stale()
+                    return
+                security_report = await screen_contract(db, security_guard, runtime, config_snapshot, kind, address)
+                if not security_report.allowed:
+                    return
+                if not still_current():
+                    record_stale()
+                    return
+
                 if config_snapshot["dry_run"]:
                     runtime["last_action"] = "dry_run"
                     add_event(
@@ -390,6 +453,8 @@ async def main():
                         address,
                         config_snapshot["source_chat_raw"],
                         config_snapshot["destination_raw"],
+                        security_report.detail(),
+                        security_report.public(),
                     )
                     log.info(
                         "[DRY_RUN] Would send to %s: %s",
@@ -403,6 +468,16 @@ async def main():
                 except FloodWaitError as exc:
                     log.warning("Telegram FloodWait: %ss", exc.seconds)
                     await asyncio.sleep(exc.seconds + 1)
+                    if not still_current():
+                        record_stale()
+                        return
+                    # Never reuse a positive result after a Telegram rate-limit wait.
+                    security_report = await screen_contract(db, security_guard, runtime, config_snapshot, kind, address)
+                    if not security_report.allowed:
+                        return
+                    if not still_current():
+                        record_stale()
+                        return
                     sent = await client.send_message(destination_entity_snapshot, address)
 
                 mark_forwarded(db, kind, address)
@@ -414,6 +489,7 @@ async def main():
                     config_snapshot["source_chat_raw"],
                     config_snapshot["destination_raw"],
                     f"message_id={sent.id}",
+                    security_report.public(),
                 )
                 runtime["last_action"] = "forwarded"
                 log.info("Forwarded successfully, message_id=%s", sent.id)
@@ -505,6 +581,9 @@ async def main():
                 "last_action": runtime["last_action"],
                 "last_event_at": runtime["last_event_at"],
                 "last_error": runtime["last_error"],
+                "last_security": runtime["last_security"],
+                "security_enabled": True,
+                **{key: cfg[key] for key in DEFAULT_SETTINGS},
             }
         )
 
@@ -539,6 +618,8 @@ async def main():
                 "dry_run": dry_run,
                 "forward_delay_seconds": delay,
                 "address_types": address_types,
+                **validate_settings({key: payload.get(key, runtime["config"][key])
+                                     for key in DEFAULT_SETTINGS}),
             }
 
             await apply_runtime_config(candidate, persist=True)
@@ -569,8 +650,30 @@ async def main():
             }
         )
 
+    async def api_security_check(request):
+        if not is_authenticated(request):
+            raise web.HTTPUnauthorized()
+        if security_test_lock.locked():
+            return web.json_response({"error": "Verifica già in corso"}, status=429)
+        async with security_test_lock:
+            try:
+                payload = await request.json()
+                address = str(payload.get("address", "")).strip()
+                kind = str(payload.get("kind", "evm"))
+                if len(address) > 100 or kind not in ALLOWED_ADDRESS_TYPES:
+                    raise ValueError("Indirizzo o tipo non valido")
+                cfg = runtime["config"].copy()
+                report = await security_guard.check(kind, address, cfg)
+                add_event(db, "security_test", kind, address, cfg["source_chat_raw"],
+                          cfg["destination_raw"], report.detail(), report.public())
+                return web.json_response(report.public())
+            except (ValueError, TypeError):
+                return web.json_response({"error": "Richiesta non valida"}, status=400)
+
     async def health_get(request):
-        return web.json_response({"ok": True, "bot": runtime["status"]})
+        return web.json_response({"ok": True, "bot": runtime["status"],
+                                  "version": "security-gate-v1", "security_enabled": True,
+                                  "security_fail_closed": True})
 
     app = web.Application(client_max_size=64 * 1024)
     app.router.add_get("/login", login_get)
@@ -580,6 +683,7 @@ async def main():
     app.router.add_get("/api/config", api_config_get)
     app.router.add_post("/api/config", api_config_post)
     app.router.add_get("/api/history", api_history_get)
+    app.router.add_post("/api/security/check", api_security_check)
     app.router.add_get("/health", health_get)
 
     runner = web.AppRunner(app)
