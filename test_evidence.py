@@ -40,16 +40,14 @@ class EvidencePolicyTest(unittest.TestCase):
         b, u, w = solana_scanner(data, DEFAULT_SETTINGS)
         self.assertFalse(b); self.assertTrue(u); self.assertTrue(w)
 
-    def test_actual_frozen_default_and_active_pause_block_but_capabilities_warn(self):
+    def test_actual_frozen_default_and_pausable_capability_block(self):
         data = native_solana(SPL2022)
         info = data['value']['data']['parsed']['info']
         for ext in [{'extension': 'defaultAccountState', 'state': {'accountState': 'frozen'}},
-                    {'extension': 'pausableConfig', 'state': {'paused': True}}]:
+                    {'extension': 'pausableConfig', 'state': {'paused': True}},
+                    {'extension': 'pausableConfig', 'state': {'paused': False}}]:
             info['extensions'] = [ext]
             self.assertTrue(solana_native(data, DEFAULT_SETTINGS)[0])
-        info['extensions'] = [{'extension': 'pausableConfig', 'state': {'paused': False}}]
-        self.assertFalse(solana_native(data, DEFAULT_SETTINGS)[0])
-        self.assertTrue(solana_native(data, DEFAULT_SETTINGS)[2])
 
     def test_identification_rejects_substrings_and_preserves_sui_case(self):
         for address, kind in [(CA, 'evm'), (MINT, 'solana'), ('0x2::sui::SUI', 'sui')]:
@@ -75,7 +73,7 @@ class EvidencePolicyTest(unittest.TestCase):
 
 
 class EvidenceAsyncTest(unittest.IsolatedAsyncioTestCase):
-    async def test_capabilities_and_missing_core_fields_pass_with_warnings(self):
+    async def test_selected_dangerous_capabilities_block_even_with_missing_fields(self):
         guard = TokenSecurity(); token = clean_goplus()
         token.update(is_blacklisted='1', transfer_pausable='1', is_proxy='1', owner_change_balance='1')
         token.pop('is_honeypot')
@@ -83,7 +81,7 @@ class EvidenceAsyncTest(unittest.IsolatedAsyncioTestCase):
             return {'code': 1, 'result': {CA: token}} if 'goplus' in url else {'pairs': []}
         with patch.object(guard, '_get', side_effect=get):
             r = await guard.check('evm', CA, {**DEFAULT_SETTINGS, 'security_chain': '56'})
-        self.assertEqual(r.verdict, 'allowed_with_warnings'); self.assertTrue(r.warnings)
+        self.assertEqual(r.verdict, 'blocked')
 
     async def test_evm_known_honeypot_survives_other_network_timeout(self):
         guard = TokenSecurity(); token = clean_goplus(); token['is_honeypot'] = '1'
