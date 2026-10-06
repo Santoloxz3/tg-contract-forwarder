@@ -1,4 +1,4 @@
-"""Read-only, fail-closed screening. Passing is not a guarantee of future sellability."""
+"""Read-only screening with evidence-based blocks and explicit coverage warnings. Passing is not a guarantee of future sellability."""
 import asyncio
 import math
 import os
@@ -33,7 +33,7 @@ RISK_FLAGS = {
 }
 DEFAULT_SETTINGS = {"security_chain": "auto", "security_max_tax_pct": 10.0,
                     "security_min_liquidity_usd": 10000.0,
-                    "security_mode": "balanced", "security_timeout_seconds": 4.0}
+                    "security_mode": "balanced", "security_timeout_seconds": 2.5}
 
 
 def number(value):
@@ -178,6 +178,11 @@ class TokenSecurity:
             return SecurityResult("unknown", ["Rete non supportata"])
         if kind == "evm" and not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
             return SecurityResult("unknown", ["Indirizzo EVM non valido"])
+        from non_evm_security import valid_mint, canonical_sui
+        if kind == "solana" and not valid_mint(address):
+            return SecurityResult("unknown", ["Mint Solana non valido"])
+        if kind == "sui" and not (canonical_sui(address) or re.fullmatch(r"0x[0-9a-fA-F]{64}", address)):
+            return SecurityResult("unknown", ["Tipo coin Sui non valido"])
         address = address.lower() if kind == "evm" else address
         if address in KNOWN_BLOCKED:
             return SecurityResult("blocked", ["MCPAD: contratto con blocchi malevoli già verificati"])
@@ -193,9 +198,22 @@ class TokenSecurity:
                     else:
                         result = await self._check_evm(session, address, settings)
                     result.checks["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+                    result.checks["address"] = address
+                    result.checks["mode"] = settings["security_mode"]
+                    if result.verdict == "unknown" and settings["security_mode"] == "balanced" and not result.checks.get("identity_error"):
+                        result.verdict = "allowed_with_warnings"
+                        result.warnings = list(dict.fromkeys(result.reasons + result.warnings))
+                        result.reasons = ["Nessun blocco concreto rilevato nei dati disponibili; verifica incompleta"]
                     return result
         except (TimeoutError, aiohttp.ClientError, ValueError, TypeError, KeyError, AttributeError):
-            return SecurityResult("unknown", ["Verifica incompleta / API indisponibile: inoltro bloccato"])
+            checks = {"elapsed_ms": round((time.monotonic() - started) * 1000), "address": address,
+                      "mode": settings.get("security_mode"), "coverage": "incomplete"}
+            if settings.get("security_mode") == "balanced" and (kind != "sui" or canonical_sui(address)):
+                if kind == "sui": checks["forward_address"] = canonical_sui(address)
+                return SecurityResult("allowed_with_warnings", ["Inoltro con verifica incompleta"],
+                                      chain_id=kind if kind != "evm" else None, checks=checks,
+                                      warnings=["Timeout/API indisponibile: nessuna verifica completa di vendibilità; rischio non escluso"])
+            return SecurityResult("unknown", ["Verifica incompleta / identificazione non riuscita"], checks=checks)
 
     async def _rpc(self, session, url, method, params):
         async with session.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}) as response:
@@ -208,54 +226,77 @@ class TokenSecurity:
 
     async def _check_evm_balanced(self, session, address, settings):
         from non_evm_security import finish
-        chain = settings["security_chain"]
-        candidates = list(CHAINS) if chain == "auto" else [chain]
+        candidates = list(CHAINS) if settings["security_chain"] == "auto" else [settings["security_chain"]]
         market = asyncio.create_task(self._get(session, f"https://api.dexscreener.com/latest/dex/tokens/{address}"))
+        tasks = {asyncio.create_task(self._get(session, f"https://api.gopluslabs.io/api/v1/token_security/{c}",
+                                             {"contract_addresses": address})): c for c in candidates}
+        pending = set(tasks); found = {}; blocked = []; warnings = []; errors = []
+        deadline = asyncio.get_running_loop().time() + max(0.05, settings["security_timeout_seconds"] - 0.1)
+        grace_deadline = deadline
         try:
-            scans = await asyncio.gather(*(self._get(session, f"https://api.gopluslabs.io/api/v1/token_security/{c}",
-                                                   {"contract_addresses": address}) for c in candidates), return_exceptions=True)
-            found = [(c, (d.get("result") or {}).get(address)) for c, d in zip(candidates, scans)
-                     if isinstance(d, dict) and d.get("code") == 1 and (d.get("result") or {}).get(address)]
-            if len(found) != 1:
-                return SecurityResult("unknown", ["Rete/token assente o ambiguo; scegli una rete EVM nel pannello"])
-            chain, token = found[0]
-            if len(candidates) > 1 and any(isinstance(d, Exception) or not isinstance(d, dict) or d.get("code") != 1 for d in scans):
-                return SecurityResult("unknown", ["Identificazione rete incompleta; scegli una rete EVM esplicita"], chain)
-            blocked, unknown, warnings = [], [], []
-            core = {"is_honeypot", "is_blacklisted", "transfer_pausable", "owner_change_balance", "personal_slippage_modifiable"}
-            hard = core | {"cannot_sell_all", "cannot_buy", "is_proxy", "hidden_owner", "selfdestruct"}
-            for key, label in RISK_FLAGS.items():
-                value = token.get(key)
-                if value == "1":
-                    (blocked if key in hard else warnings).append(label)
-                elif value != "0":
-                    (unknown if key in core else warnings).append(f"GoPlus: {key} non verificato")
-            for key in ("buy_tax", "sell_tax", "transfer_tax"):
-                tax = number(token.get(key))
-                if tax is None:
-                    warnings.append(f"{key} non ancora disponibile")
-                elif tax * 100 > settings["security_max_tax_pct"]:
-                    blocked.append(f"{key} {tax * 100:.2f}% oltre soglia")
-            if token.get("is_open_source") != "1":
-                warnings.append("Codice non verificato / indicizzazione incompleta: nessun audit del codice")
+            while pending:
+                done, pending = await asyncio.wait(pending, timeout=max(0, min(deadline, grace_deadline) - asyncio.get_running_loop().time()),
+                                                   return_when=asyncio.FIRST_COMPLETED)
+                if not done: break
+                for task in done:
+                    chain = tasks[task]
+                    try:
+                        data = task.result()
+                        token = (data.get("result") or {}).get(address) if data.get("code") == 1 else None
+                        if not token: continue
+                        found[chain] = token
+                        for key, label in RISK_FLAGS.items():
+                            value = token.get(key)
+                            if value == "1":
+                                (blocked if key in {"is_honeypot", "cannot_sell_all", "cannot_buy"} else warnings).append(label)
+                            elif value != "0": warnings.append(f"GoPlus: {key} non verificato")
+                        for key in ("buy_tax", "sell_tax", "transfer_tax"):
+                            tax = number(token.get(key))
+                            if tax is None: warnings.append(f"{key}: dato non disponibile")
+                            elif tax * 100 > settings["security_max_tax_pct"]:
+                                blocked.append(f"{key} {tax * 100:.2f}% oltre soglia")
+                        if token.get("is_open_source") != "1": warnings.append("Codice non verificato: analisi incompleta")
+                    except Exception:
+                        errors.append(f"Scanner {CHAINS[chain]} indisponibile")
+                if len(found) > 1:
+                    return SecurityResult("unknown", ["Stesso indirizzo presente su più reti: identificazione ambigua"],
+                                          checks={"identity_error": True, "networks": list(found)})
+                # Known concrete danger must not be lost while another network times out.
+                if blocked: break
+                if found: grace_deadline = min(grace_deadline, asyncio.get_running_loop().time() + 0.03)
+            if pending: warnings.append("Riconoscimento EVM parziale: alcune reti non hanno risposto nel budget")
+            warnings.extend(errors)
+            chain = next(iter(found), None)
+            token = found.get(chain, {})
             pairs = []
             if market.done() and not market.cancelled():
-                try:
-                    pairs = (market.result().get("pairs") or [])
-                except Exception:
-                    pass
-            pairs = [p for p in pairs if p.get("chainId") == CHAINS[chain] and
+                try: pairs = market.result().get("pairs") or []
+                except Exception: pass
+            pairs = [p for p in pairs if isinstance(p, dict) and p.get("chainId") in CHAINS.values() and
                      str((p.get("baseToken") or {}).get("address", "")).lower() == address]
+            networks = {p.get("chainId") for p in pairs} | ({CHAINS[chain]} if chain else set())
+            if settings["security_chain"] == "auto" and len(networks) > 1:
+                return SecurityResult("unknown", ["Indirizzo presente su più reti: impossibile scegliere automaticamente"], checks={"identity_error": True})
+            if chain is None and len(networks) == 1:
+                chain = next(c for c in CHAINS if CHAINS[c] in networks)
+            if not token: warnings.append("Scanner non indicizzato: honeypot, privilegi e tasse non verificati")
+            if chain is None: warnings.append("Rete EVM specifica non confermata; indirizzo riconosciuto come EVM")
+            pairs = [p for p in pairs if chain and p.get("chainId") == CHAINS[chain]]
             liquidity = max((number((p.get("liquidity") or {}).get("usd")) or 0 for p in pairs), default=None)
-            if liquidity is None:
-                warnings.append("Pool/liquidità non indicizzate: possibile lancio recente")
+            if liquidity is None: warnings.append("Pool/liquidità non indicizzate: possibile lancio recente")
             elif liquidity < settings["security_min_liquidity_usd"]:
                 warnings.append(f"Liquidità ${liquidity:,.0f} sotto soglia di avviso")
-            warnings.append("Modalità rapida: nessuna simulazione acquisto/vendita; importo Maestro non verificato")
-            return finish(blocked, unknown, warnings, chain, {"goplus": {k: token.get(k) for k in RISK_FLAGS}, "liquidity_usd": liquidity})
+            warnings.append("Nessuna simulazione acquisto/vendita; wallet e importo destinazione non verificati")
+            identity = (pairs[0].get("baseToken") or {}) if pairs else {}
+            return finish(blocked, [], list(dict.fromkeys(warnings)), chain,
+                          {"name": token.get("token_name") or identity.get("name"),
+                           "symbol": token.get("token_symbol") or identity.get("symbol"),
+                           "goplus": {k: token.get(k) for k in (*RISK_FLAGS, "is_open_source", "buy_tax", "sell_tax", "transfer_tax")},
+                           "liquidity_usd": liquidity, "networks_checked": [tasks[t] for t in tasks if t.done() and not t.cancelled()],
+                           "coverage": "partial" if pending or errors or not token else "scanner"})
         finally:
-            market.cancel()
-            await asyncio.gather(market, return_exceptions=True)
+            for task in [market, *tasks]: task.cancel()
+            await asyncio.gather(market, *tasks, return_exceptions=True)
 
     async def _check_evm(self, session, address, settings):
         chain_id = settings["security_chain"]

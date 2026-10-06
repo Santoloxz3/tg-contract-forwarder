@@ -43,6 +43,7 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
 .notice{margin-top:12px;font-size:12px;color:#8290b5;line-height:1.45}
 .securityBox{border:1px solid rgba(102,230,174,.25);border-radius:17px;padding:16px;margin:18px 0;background:rgba(102,230,174,.035)}
 .securityBox h2{color:var(--green)}.securityBox .hint{color:var(--muted);line-height:1.5}
+.controlInfo{font-size:12px;line-height:1.65;color:#bac7e7;margin-top:14px}.controlInfo summary{cursor:pointer;color:#8fb4ff;font-weight:800}.controlInfo p{margin:14px 0}.controlInfo b{color:#e7ebff}
 .securityResult{font-size:12px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:12px;color:#bac7e7}
 .state.security_blocked,.state.security_unknown{background:rgba(255,131,150,.12);color:#ffabb8}
 .state.security_test,.state.stale_ignored{background:rgba(255,217,117,.11);color:#ffe199}
@@ -66,14 +67,14 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
 <body>
 <div class="wrap">
   <header class="top">
-    <div class="brand"><div class="logo">🤖</div><div><h1>CA Courier</h1><p>Telegram Contract Forwarder</p></div></div>
+    <div class="brand"><div class="logo">🤖</div><div><h1>CA Courier</h1><p>Token Courier • riconoscimento automatico</p></div></div>
     <form method="post" action="/logout"><button class="logout">Esci</button></form>
   </header>
 
   <main class="grid">
     <section class="card">
       <h2>Impostazioni del corriere</h2>
-      <p class="desc">Cambia il percorso dei contract address. Le modifiche diventano operative appena salvi.</p>
+      <p class="desc">Scegli da dove ricevere i token e dove inoltrarli. Le modifiche diventano operative appena salvi.</p>
 
       <div class="row">
         <div class="field">
@@ -96,11 +97,11 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
       <div class="field">
         <label for="delay">Delay tecnico</label>
         <input id="delay" type="number" min="0" max="30" step="0.5">
-        <div class="hint">Secondi tra rilevamento e inoltro. Range consentito: 0–30 s.</div>
+        <div class="hint">Attesa minima dal rilevamento, sovrapposta ai controlli. Impostata a 1 s; range 0–30 s.</div>
       </div>
 
       <div class="field">
-        <label>Address types</label>
+        <label>Reti abilitate · riconoscimento automatico</label>
         <div class="chains">
           <label class="chip"><input type="checkbox" value="evm"><span>⟠ EVM</span></label>
           <label class="chip"><input type="checkbox" value="solana"><span>◎ Solana</span></label>
@@ -111,19 +112,24 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
 
       <div class="securityBox">
         <h2>🛡️ Filtro antifrode attivo</h2>
-        <p class="desc">Blocchi concreti e controlli essenziali mancanti impediscono l'inoltro. In modalità bilanciata, dati di mercato incompleti e rischi secondari producono avvisi.</p>
+        <p class="desc">La modalità rapida blocca restrizioni rilevate e commissioni oltre soglia. Poteri amministrativi e dati incompleti producono avvisi, anche quando la verifica non termina.</p>
         <div class="row">
-          <div class="field"><label for="securityMode">Modalità</label><select id="securityMode"><option value="balanced">Bilanciata — rapida, ammette avvisi</option><option value="strict">Prudente — controlli più restrittivi</option></select></div>
-          <div class="field"><label for="securityTimeout">Tempo massimo controlli (s)</label><input id="securityTimeout" type="number" min="1" max="10" step="0.5"><div class="hint">Default 4 s. Il delay tecnico è separato.</div></div>
+          <div class="field"><label for="securityMode">Modalità</label><select id="securityMode"><option value="balanced">Rapida — blocchi su evidenze, rischi come avvisi</option><option value="strict">Prudente — controlli più restrittivi</option></select></div>
+          <div class="field"><label for="securityTimeout">Tempo massimo controlli (s)</label><input id="securityTimeout" type="number" min="1" max="10" step="0.5"><div class="hint">Budget massimo 2,5 s, senza attesa obbligatoria. Le fonti partono in parallelo; il delay si sovrappone.</div></div>
         </div>
-        <div class="field"><label for="securityChain">Rete EVM da verificare</label>
-          <select id="securityChain"><option value="auto">Automatica — blocca reti ambigue</option><option value="56">BNB Chain</option><option value="1">Ethereum</option><option value="8453">Base</option></select>
-        </div>
+        <div class="hint">La rete viene riconosciuta dal token: Solana, Sui oppure Ethereum, BNB Chain e Base. Un indirizzo presente su più reti richiede identificazione e non viene inoltrato.</div>
         <div class="row">
-          <div class="field"><label for="maxTax">Tassa massima (%)</label><input id="maxTax" type="number" min="0" max="20" step="0.5"><div class="hint">Acquisto, vendita e trasferimento. Default 10%.</div></div>
-          <div class="field"><label for="minLiquidity">Soglia liquidità EVM ($)</label><input id="minLiquidity" type="number" min="0" max="1000000" step="1000"><div class="hint">Bilanciata: avviso. Prudente: blocco. Nessuna soglia obbligatoria su Solana/Sui.</div></div>
+          <div class="field"><label for="maxTax">Commissione massima (%)</label><input id="maxTax" type="number" min="0" max="20" step="0.5"><div class="hint">Acquisto, vendita e trasferimento. Default 10%.</div></div>
+          <div class="field"><label for="minLiquidity">Avviso liquidità ($)</label><input id="minLiquidity" type="number" min="0" max="1000000" step="1000"><div class="hint">Rilevata su EVM quando disponibile. Assenza di dati su Solana/Sui: avviso; nessuna soglia minima obbligatoria.</div></div>
         </div>
-        <div class="hint">Sempre bloccati: blacklist/congelamento, non trasferibilità, restrizioni rilevate alla vendita e tasse oltre soglia. Bilanciata: mint, metadati, pochi dati e liquidità non indicizzata diventano avvisi. Solana: scanner o lettura nativa SPL/Token-2022. Sui: blacklist/DenyCap; capacità di mint e upgrade sono avvisi. EVM rapida: GoPlus, senza simulazione obbligatoria. Nessuna garanzia di vendibilità futura o profitto. Maestro non supporta Sui: i CA Sui possono essere verificati, ma non gli vengono inoltrati.</div>
+        <details class="controlInfo"><summary>ⓘ Controlli, blocchi e avvisi per rete</summary>
+          <p><b>Regola comune · modalità rapida</b><br>Blocchi: MCPAD già verificato malevolo, honeypot o restrizioni di acquisto/vendita rilevate, token non trasferibile, stato iniziale congelato/non utilizzabile, pausa attiva e commissioni native note oltre la soglia. Sono restrizioni o costi rilevati, non una certificazione di truffa. Identificazioni ambigue/non valide non vengono inoltrate.</p>
+          <p><b>EVM · Ethereum, BNB Chain, Base</b><br>GoPlus cerca il token sulle tre reti in parallelo. Verifica honeypot, vendita del saldo completo, acquisti e tasse di acquisto/vendita/trasferimento (blocchi se positivi o oltre soglia). Avvisi per proxy, blacklist possibile, whitelist, pausa possibile, tasse globali o per wallet modificabili, saldi modificabili, proprietario nascosto/recuperabile, autodistruzione, chiamate esterne, mint, cooldown, limiti modificabili, codice non verificato e campi mancanti. Dexscreener aggiunge identità e liquidità se già disponibili; pool assente o sotto soglia è un avviso. Non viene simulata la vendita in modalità rapida.</p>
+          <p><b>Solana · SPL e Token-2022</b><br>RPC nativo e GoPlus partono insieme. Si verificano programma del mint, inizializzazione, freeze/mint authority, trasferibilità, stato iniziale degli account, commissioni attuali e programmate, autorità commissioni, hook, delegato permanente, chiusura mint, pausa, burn e altre estensioni. Blocchi: non trasferibilità, nuovi account congelati/non utilizzabili, pausa confermata e commissioni native attuali/programmate oltre soglia. Avvisi: autorità di freeze/mint, commissioni modificabili, hook presenti/modificabili, delegato permanente, close authority, default state modificabile, burn, metadati modificabili, creatore segnalato, estensioni sconosciute e dati assenti. Le unità commissioni dello scanner possono essere ambigue: la soglia usa i basis point del RPC. Non si analizza il congelamento di un wallet specifico né si simula la vendita.</p>
+          <p><b>Sui · tipo completo della coin</b><br>Un package viene risolto solo se identifica una coin unica; il tipo mantiene le maiuscole. GoPlus controlla blacklist/DenyCap, mint, upgrade e metadati: nella modalità rapida questi poteri e i dati mancanti sono avvisi. Non si verifica un blocco del wallet specifico, non si simulano vendite e non si verificano commissioni, liquidità o routing. Maestro non supporta Sui: la verifica è disponibile, l'inoltro a Maestro viene fermato.</p>
+          <p><b>Dati incompleti e tempi</b><br>In modalità rapida timeout, API indisponibili e indicizzazione incompleta consentono l'inoltro con avvisi espliciti. Una fonte lenta può restare incompleta. Nessuna attesa per holder minimi, età del token o migrazione della pool. Nessun controllo garantisce sicurezza, profitto o vendibilità futura.</p>
+          <p><b>Modalità prudente opzionale</b><br>EVM richiede pool e liquidità minima, GoPlus completo e simulazione Honeypot.is (identità, rete, pool, tasse, limiti, codice e livello/segnalazioni di rischio). I poteri amministrativi sono bloccanti. Solana richiede dati essenziali e blocca freeze, mint, hook, delegato, commissioni modificabili, close authority e pausa/burn; Sui blocca DenyCap, mint e upgrade. Dati essenziali mancanti o timeout impediscono l'inoltro. Nessuna simulazione wallet/importo del bot di destinazione.</p>
+        </details>
       </div>
       <button id="save" class="save">Salva configurazione 🚀</button>
     </section>
@@ -132,7 +138,7 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
       <div class="statusbar"><div class="dot"></div><div><strong id="status">Bot online</strong> <span id="tguser"></span></div></div>
 
       <div class="metrics">
-        <div class="metric"><div class="k">CA inoltrati</div><div class="v" id="count">—</div></div>
+        <div class="metric"><div class="k">Token inoltrati</div><div class="v" id="count">—</div></div>
         <div class="metric"><div class="k">Modalità</div><div class="v small" id="mode">—</div></div>
       </div>
 
@@ -144,7 +150,7 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
       </div>
 
       <div class="last">
-        <div class="cap">Ultimo CA visto</div>
+        <div class="cap">Ultimo token rilevato</div>
         <code id="lastAddress">Nessun evento recente</code>
         <div class="badge" id="lastBadge">IN ASCOLTO</div>
       </div>
@@ -152,8 +158,8 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
       <p class="notice">🛡️ Lo storico anti-duplicato è persistente: un CA già inoltrato non viene inoltrato di nuovo dopo un riavvio o un deploy.</p>
       <h2>Ultimo controllo antifrode</h2><div id="lastSecurity" class="securityResult">Nessun controllo recente.</div>
       <div class="securityBox">
-        <h2>Verifica un CA</h2><p class="desc">Usa la rete e le soglie salvate. Non inoltra nulla a Maestro.</p>
-        <label for="testKind">Rete</label><select id="testKind"><option value="evm">EVM</option><option value="solana">Solana</option><option value="sui">Sui</option></select>
+        <h2>Verifica un token</h2><p class="desc">Incolla il token: rete automatica e soglie salvate. Questa verifica non inoltra messaggi.</p>
+        <div id="detectedNetwork" class="hint" role="status">Rete riconosciuta automaticamente dopo aver inserito il token.</div>
         <label for="testAddress" style="margin-top:12px">Contract address / coin type</label><input id="testAddress" type="text" placeholder="CA o 0x…::modulo::TOKEN" autocomplete="off">
         <button class="miniBtn" id="testSecurity" style="margin-top:12px">Controlla senza inoltrare</button>
         <div id="testResult" class="securityResult" role="status" aria-live="polite"></div>
@@ -163,7 +169,7 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(141,166,255,.11
 
   <section class="card history">
     <div class="historyHead">
-      <div><h2>Registro CA 📬</h2><p class="desc">Inoltri, blocchi antifrode, verifiche, duplicati, dry-run ed errori. Apri i dettagli per leggere tutti i motivi.</p></div>
+      <div><h2>Registro token 📬</h2><p class="desc">Inoltri, blocchi antifrode, verifiche, duplicati, dry-run ed errori. Apri i dettagli per leggere tutti i motivi.</p></div>
       <div class="historyTools"><button class="miniBtn" id="refreshHistory">Aggiorna ↻</button></div>
     </div>
     <div id="eventList" class="eventList"><div class="empty">Nessun evento registrato.</div></div>
@@ -176,7 +182,34 @@ const $=s=>document.querySelector(s);
 const $$=s=>[...document.querySelectorAll(s)];
 let dirty=false;
 const escapeHTML=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-function securityText(s){return s?({allowed:"CONTROLLI SUPERATI",allowed_with_warnings:"AMMESSO CON AVVISI",blocked:"BLOCCATO",unknown:"NON VERIFICABILE"}[s.verdict]||"NON VERIFICABILE")+(s.chain_id?" • rete "+s.chain_id:"")+(s.checks?.elapsed_ms!==undefined?" • "+s.checks.elapsed_ms+" ms":"")+"\n"+(s.reasons||[]).join("\n")+(s.warnings?.length?"\nAvvisi:\n"+s.warnings.join("\n"):""):"Nessun controllo recente."}
+const networkNames={"1":"Ethereum","56":"BNB Chain","8453":"Base",evm:"EVM",solana:"Solana",sui:"Sui"};
+function evidenceText(c){
+  const labels={is_proxy:"Proxy",is_honeypot:"Honeypot",is_blacklisted:"Blacklist possibile",is_whitelisted:"Whitelist",transfer_pausable:"Pausa possibile",slippage_modifiable:"Tasse modificabili",personal_slippage_modifiable:"Tasse per wallet modificabili",owner_change_balance:"Saldi modificabili",hidden_owner:"Proprietario nascosto",can_take_back_ownership:"Proprietà recuperabile",selfdestruct:"Autodistruzione",external_call:"Chiamate esterne",is_mintable:"Mint",cannot_sell_all:"Restrizione vendita saldo",cannot_buy:"Acquisti impediti",trading_cooldown:"Cooldown",anti_whale_modifiable:"Limiti modificabili",is_open_source:"Codice verificato",blacklist:"DenyCap/blacklist",mintable:"Mint",contract_upgradeable:"Upgrade",metadata_modifiable:"Metadati modificabili",freezable:"Freeze possibile",balance_mutable_authority:"Saldi modificabili",closable:"Chiusura mint",default_account_state:"Stato iniziale account",non_transferable:"Non trasferibilità",transfer_fee_upgradable:"Tasse modificabili",transfer_hook_upgradable:"Hook modificabile",metadata_mutable:"Metadati modificabili"};
+  const out=[];
+  for(const [k,v] of Object.entries(c.goplus||c.scanner_fields||{})){
+    if(["buy_tax","sell_tax","transfer_tax"].includes(k)){out.push(k.replaceAll("_"," ")+": "+(v!==null&&v!==undefined&&v!==""&&Number.isFinite(Number(v))?(Number(v)*100).toFixed(2)+"%":"non verificata"));continue}
+    if(!labels[k])continue;
+    const raw=typeof v==="object"&&v!==null?(v.status??v.value):v;
+    out.push(labels[k]+": "+(k==="default_account_state"?({"1":"inizializzato","2":"congelato","0":"non inizializzato"}[String(raw)]||"non verificato"):[0,"0"].includes(raw)?"non rilevato":[1,"1",2,"2"].includes(raw)?"rilevato":"non verificato"));
+  }
+  if(c.mint_fields){
+    const m=c.mint_fields;
+    out.push("Lettura nativa · freeze authority: "+(m.freezeAuthority===null?"assente":m.freezeAuthority?"presente":"non verificata"));
+    out.push("Lettura nativa · mint authority: "+(m.mintAuthority===null?"assente":m.mintAuthority?"presente":"non verificata"));
+    for(const e of m.extensions||[]){
+      out.push("Estensione: "+e.extension);
+      if(e.extension==="transferFeeConfig")for(const [k,title] of [["olderTransferFee","Commissione attuale"],["newerTransferFee","Commissione programmata"]]){
+        const fee=e.state?.[k]?.transferFeeBasisPoints;out.push(title+": "+(fee!==undefined?Number(fee)/100+"%":"non verificata"));
+      }
+    }
+  }
+  if(c.providers)out.push("Fonti completate: "+Object.keys(c.providers).join(", "));
+  if(c.networks_checked)out.push("Reti consultate: "+c.networks_checked.map(n=>networkNames[n]||n).join(", "));
+  if(c.liquidity_usd!==undefined)out.push("Liquidità rilevata: "+(c.liquidity_usd===null?"non disponibile":"$"+Number(c.liquidity_usd).toLocaleString("it-IT")));
+  if(c.coverage==="incomplete"||c.coverage==="partial")out.push("Copertura: incompleta");
+  return out.length?"Controlli e dati:\n"+out.join("\n"):"Dati dei controlli non disponibili.";
+}
+function securityText(s){return s?({allowed:"CONTROLLI SUPERATI",allowed_with_warnings:"AMMESSO CON AVVISI",blocked:"BLOCCATO",unknown:"NON VERIFICABILE"}[s.verdict]||"NON VERIFICABILE")+(s.checks?.name?" • "+s.checks.name+(s.checks.symbol?" ("+s.checks.symbol+")":""):"")+(s.chain_id?" • "+(networkNames[s.chain_id]||s.chain_id):" • rete specifica non confermata")+(s.checks?.elapsed_ms!==undefined?" • "+s.checks.elapsed_ms+" ms":"")+"\n"+(s.reasons||[]).join("\n")+(s.warnings?.length?"\nAvvisi:\n"+s.warnings.join("\n"):"")+(s.checks?"\n\n"+evidenceText(s.checks):""):"Nessun controllo recente."}
 const toast=(msg,ok=true)=>{const t=$("#toast");t.textContent=msg;t.className="toast show "+(ok?"ok":"bad");setTimeout(()=>t.className="toast",2600)};
 
 function actionLabel(a){
@@ -190,11 +223,10 @@ function render(d){
   $("#source").value=d.source_chat||"";
   $("#destination").value=d.destination_bot||"";
   $("#dry").checked=!!d.dry_run;
-  $("#delay").value=d.forward_delay_seconds ?? 2;
+  $("#delay").value=d.forward_delay_seconds ?? 1;
   $$(".chip input").forEach(x=>x.checked=(d.address_types||[]).includes(x.value));
-  $("#securityChain").value=d.security_chain||"auto";
   $("#securityMode").value=d.security_mode||"balanced";
-  $("#securityTimeout").value=d.security_timeout_seconds??4;
+  $("#securityTimeout").value=d.security_timeout_seconds??2.5;
   $("#maxTax").value=d.security_max_tax_pct??10;
   $("#minLiquidity").value=d.security_min_liquidity_usd??10000;
   }
@@ -223,9 +255,9 @@ function renderHistory(events){
   box.innerHTML=events.map(e=>`
     <div class="event">
       <div class="eventTime">${escapeHTML(fmtTime(e.event_at))}</div>
-      <div class="chain ${escapeHTML(e.chain_type||"")}">${escapeHTML(chainLabel(e.chain_type))}</div>
+      <div class="chain ${escapeHTML(e.chain_type||"")}">${escapeHTML((networkNames[e.security?.chain_id]||chainLabel(e.chain_type)))}</div>
       <div class="addr">
-        <code title="${escapeHTML(e.address||"")}">${escapeHTML(e.address||"—")}</code>
+        <code title="${escapeHTML(e.address||"")}">${escapeHTML(e.address||"—")}</code>${e.security?.checks?.name?`<b>${escapeHTML(e.security.checks.name)} ${escapeHTML(e.security.checks.symbol||"")}</b>`:""}
         <small>${escapeHTML(e.source_chat||"—")} → ${escapeHTML(e.destination_bot||"—")}${e.detail?" • "+escapeHTML(e.detail):""}</small>
         ${e.security?`<details><summary>Dettagli controllo</summary><p>${escapeHTML(securityText(e.security)).replace(/\n/g,"<br>")}</p></details>`:""}
       </div>
@@ -256,7 +288,7 @@ $("#save").addEventListener("click",async()=>{
       dry_run:$("#dry").checked,
       forward_delay_seconds:Number($("#delay").value),
       address_types:$$(".chip input:checked").map(x=>x.value),
-      security_chain:$("#securityChain").value,
+      security_chain:"auto",
       security_mode:$("#securityMode").value,
       security_timeout_seconds:Number($("#securityTimeout").value),
       security_max_tax_pct:Number($("#maxTax").value),
@@ -272,14 +304,19 @@ $("#save").addEventListener("click",async()=>{
   finally{b.disabled=false;b.textContent="Salva configurazione 🚀"}
 });
 $$('main section input,main section select').forEach(x=>x.addEventListener('input',()=>{dirty=true}));
+$("#testAddress").addEventListener("input",()=>{
+  const a=$("#testAddress").value.trim();
+  const kind=/^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/.test(a)||/^0x[0-9a-fA-F]{64}$/.test(a)?"Sui":/^0x[0-9a-fA-F]{40}$/.test(a)?"EVM (rete specifica in verifica)":/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(a)?"Solana (mint da verificare)":null;
+  $("#detectedNetwork").textContent=kind?"Rete riconosciuta: "+kind:"Inserisci un indirizzo token valido.";
+});
 $("#testSecurity").addEventListener("click",async()=>{
   const b=$("#testSecurity");b.disabled=true;
   $("#testResult").textContent="Verifica in corso…";
   try{
-    const r=await fetch("/api/security/check",{method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",body:JSON.stringify({address:$("#testAddress").value.trim(),kind:$("#testKind").value})});
+    const r=await fetch("/api/security/check",{method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",body:JSON.stringify({address:$("#testAddress").value.trim()})});
     if(r.status===401){location.href="/login";return}
     const d=await r.json();if(!r.ok) throw new Error(d.error||"Verifica non disponibile");
-    $("#testResult").textContent=securityText(d);await loadHistory();
+    $("#detectedNetwork").textContent="Rete: "+(networkNames[d.chain_id]||networkNames[d.kind]||"Non identificata");$("#testResult").textContent=securityText(d);await loadHistory();
   }catch(e){$("#testResult").textContent=e.message}
   finally{b.disabled=false}
 });

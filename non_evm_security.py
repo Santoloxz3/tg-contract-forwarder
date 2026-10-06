@@ -1,4 +1,4 @@
-"""Native-chain screening: absent market data is an advisory, absent core checks is not."""
+"""Native-chain screening: capabilities are advisories in balanced mode; active restrictions block."""
 import asyncio
 import os
 import re
@@ -13,7 +13,7 @@ SUI_TYPE = re.compile(r"0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A
 
 def finish(blocked, unknown, warnings, chain, checks):
     verdict = "blocked" if blocked else "unknown" if unknown else "allowed_with_warnings" if warnings else "allowed"
-    return SecurityResult(verdict, blocked + unknown or ["Controlli essenziali disponibili superati"],
+    return SecurityResult(verdict, blocked + unknown or ["Nessun blocco rilevato nei controlli disponibili"],
                           chain_id=chain, checks=checks, warnings=warnings)
 
 
@@ -51,22 +51,28 @@ def solana_scanner(token, settings):
         return [], ["Scanner Solana: mint non ancora indicizzato"], []
     for key in ("freezable", "balance_mutable_authority", "closable", "default_account_state_upgradable", "transfer_fee_upgradable", "transfer_hook_upgradable"):
         s = status(token.get(key))
-        if s == "1": blocked.append(f"Solana: {key} attivo")
+        if s == "1": (blocked if settings["security_mode"] == "strict" else warnings).append(f"Solana: {key} attivo (potere amministrativo)")
         elif s != "0": unknown.append(f"Solana: {key} non verificato")
     if scalar(token.get("non_transferable")) == "1": blocked.append("Solana: token non trasferibile")
     elif scalar(token.get("non_transferable")) != "0": unknown.append("Solana: trasferibilità non verificata")
     if scalar(token.get("default_account_state")) in {"0", "2"}: blocked.append("Solana: nuovi account non inizializzati/congelati")
     elif scalar(token.get("default_account_state")) != "1": unknown.append("Solana: stato account non verificato")
     hooks = token.get("transfer_hook")
-    if hooks: blocked.append("Solana: transfer hook può imporre restrizioni alle vendite")
+    if hooks: (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: transfer hook presente; effetto sulle vendite non simulato")
     elif not isinstance(hooks, list): unknown.append("Solana: transfer hook non verificato")
     if not isinstance(token.get("transfer_fee"), dict):
         unknown.append("Solana: transfer fee non verificata")
-    for fee in (token.get("transfer_fee") or {}).values():
+    # Scanner unit differs from the documented basis-point format in some responses.
+    # Native RPC uses unambiguous integer basis points and enforces the threshold.
+    fees = token.get("transfer_fee") or {}
+    fee_items = [fees.get("current_fee_rate")] + (fees.get("scheduled_fee_rate") or [])
+    for fee in fee_items:
         if isinstance(fee, dict):
             rate = number(fee.get("fee_rate"))
             if rate is None: unknown.append("Solana: transfer fee non verificata")
-            elif rate / 100 > settings["security_max_tax_pct"]: blocked.append("Solana: tassa di trasferimento oltre soglia")
+            else:
+                warnings.append(f"Solana: scanner fee_rate={rate:g}; unità da confermare dalla lettura nativa")
+                if rate: unknown.append("Solana: commissioni dello scanner da confermare con RPC nativo")
     for key in ("mintable", "metadata_mutable"):
         if status(token.get(key)) == "1": warnings.append(f"Solana: {key} attivo")
     if settings["security_mode"] == "strict":
@@ -75,7 +81,7 @@ def solana_scanner(token, settings):
         elif mint != "0": unknown.append("Solana: mint non verificato in modalità prudente")
     for creator in token.get("creators", []):
         if isinstance(creator, dict) and str(creator.get("malicious_address")) == "1":
-            blocked.append("Solana: creatore segnalato malevolo")
+            (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: creatore segnalato malevolo dallo scanner; reputazione non prova di restrizioni")
     if not token.get("dex"): warnings.append("DEX non ancora indicizzato; nessuna soglia minima obbligatoria in modalità bilanciata")
     return blocked, unknown, warnings
 
@@ -83,16 +89,20 @@ def solana_scanner(token, settings):
 def solana_native(result, settings):
     blocked, unknown, warnings = [], [], []
     account = result.get("value") if isinstance(result, dict) else None
-    if not isinstance(account, dict) or account.get("owner") not in {SPL, SPL2022} or account.get("executable") is not False:
-        return [], ["RPC Solana: non è un mint SPL verificabile"], []
+    if not isinstance(account, dict):
+        return [], ["RPC Solana: account non disponibile/non indicizzato"], []
+    if account.get("owner") not in {SPL, SPL2022} or account.get("executable") is not False:
+        return ["RPC Solana: l'indirizzo non è un mint SPL/Token-2022"], [], []
     parsed = (account.get("data") or {}).get("parsed") or {}
     info = parsed.get("info") or {}
+    if parsed.get("type") and parsed.get("type") != "mint":
+        return ["RPC Solana: account token/wallet, non un mint"], [], []
     if parsed.get("type") != "mint" or info.get("isInitialized") is not True:
         return [], ["RPC Solana: mint non inizializzato/verificato"], []
     if "freezeAuthority" not in info:
         unknown.append("RPC Solana: freeze authority non verificata")
     elif info["freezeAuthority"] is not None:
-        blocked.append("Solana: autorità di congelamento attiva")
+        (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: autorità può congelare account; nessun congelamento del wallet verificato")
     if info.get("mintAuthority"):
         warnings.append("Solana: autorità di mint attiva (rischio diluizione)")
         if settings["security_mode"] == "strict": blocked.append("Solana: mint attivo non ammesso in modalità prudente")
@@ -112,30 +122,36 @@ def solana_native(result, settings):
                     continue
                 if kind == "transferFeeConfig":
                     if state.get("transferFeeConfigAuthority") is not None:
-                        blocked.append("Solana: commissioni modificabili")
+                        (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: commissioni modificabili")
                     elif "transferFeeConfigAuthority" not in state:
                         unknown.append("Solana: autorità commissioni non verificata")
                     for key in ("olderTransferFee", "newerTransferFee"):
                         rate = number((state.get(key) or {}).get("transferFeeBasisPoints"))
                         if rate is None: unknown.append("Solana: commissione non verificata")
-                        elif rate / 100 > settings["security_max_tax_pct"]: blocked.append("Solana: commissione oltre soglia")
+                        elif rate / 100 > settings["security_max_tax_pct"]: blocked.append(f"Solana: commissione {rate / 100:g}% oltre soglia ({key})")
+                        elif rate: warnings.append(f"Solana: commissione {rate / 100:g}% ({key})")
                 elif kind == "defaultAccountState":
                     if state.get("accountState") != "initialized":
                         blocked.append("Solana: stato account restrittivo")
                 elif kind == "transferHook":
                     if state.get("programId") or state.get("authority"):
-                        blocked.append("Solana: hook sui trasferimenti attivo/modificabile")
+                        (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: hook sui trasferimenti presente/modificabile; vendite non simulate")
                     elif not {"programId", "authority"} <= state.keys():
                         unknown.append("Solana: hook non verificato")
                 elif kind == "permanentDelegate":
                     if state.get("delegate"):
-                        blocked.append("Solana: delegato permanente può trasferire/bruciare i saldi")
+                        (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: delegato permanente può trasferire/bruciare i saldi")
                     elif "delegate" not in state: unknown.append("Solana: delegato non verificato")
                 elif kind == "mintCloseAuthority":
-                    if state.get("closeAuthority"): blocked.append("Solana: mint chiudibile")
+                    if state.get("closeAuthority"): (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: mint chiudibile")
                     elif "closeAuthority" not in state: unknown.append("Solana: close authority non verificata")
-                elif kind in {"nonTransferable", "pausableConfig", "permissionedBurn"}:
-                    blocked.append(f"Solana: estensione restrittiva {kind}")
+                elif kind == "nonTransferable":
+                    blocked.append("Solana: token non trasferibile")
+                elif kind == "pausableConfig":
+                    if state.get("paused") is True: blocked.append("Solana: trasferimenti attualmente sospesi")
+                    else: (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: trasferimenti sospendibili; pausa non confermata")
+                elif kind == "permissionedBurn":
+                    (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: permissioned burn presente")
                 else:
                     unknown.append(f"Solana: estensione {kind} non ancora analizzata")
     return blocked, unknown, warnings
@@ -146,28 +162,39 @@ async def check_solana(guard, session, address, settings):
     gp = asyncio.create_task(guard._get(session, "https://api.gopluslabs.io/api/v1/solana/token_security", {"contract_addresses": address}))
     rpc = asyncio.create_task(guard._rpc(session, os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
                                        "getAccountInfo", [address, {"encoding": "jsonParsed", "commitment": "processed"}]))
-    pending = {gp, rpc}; reports = {}; warnings = []; blocked = []
+    pending = {gp, rpc}; reports = {}; warnings = []; blocked = []; identity = {}
+    deadline = asyncio.get_running_loop().time() + max(0.05, settings["security_timeout_seconds"] - 0.1)
+    def checks(): return {"providers": reports, **identity}
     try:
         while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(pending, timeout=max(0, deadline - asyncio.get_running_loop().time()), return_when=asyncio.FIRST_COMPLETED)
+            if not done: break
             for task in done:
                 try:
                     data = task.result()
                     if task is gp:
                         token = (data.get("result") or {}).get(address) if data.get("code") == 1 else None
                         report = solana_scanner(token, settings)
+                        metadata = (token or {}).get("metadata") or {}
+                        identity.update({k: metadata[k] for k in ("name", "symbol") if metadata.get(k)})
+                        identity["scanner_fields"] = {k: token.get(k) for k in ("freezable", "mintable", "balance_mutable_authority", "closable", "default_account_state", "non_transferable", "transfer_fee", "transfer_fee_upgradable", "transfer_hook", "transfer_hook_upgradable", "metadata_mutable") } if token else {}
                     else:
                         report = solana_native(data, settings)
+                        info = (((data.get("value") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+                        identity["mint_fields"] = {k: info.get(k) for k in ("isInitialized", "freezeAuthority", "mintAuthority", "extensions")}
+                        for ext in info.get("extensions") or []:
+                            if ext.get("extension") == "tokenMetadata":
+                                identity.update({k: ext.get("state", {}).get(k) for k in ("name", "symbol")})
                     reports["goplus" if task is gp else "rpc"] = report
                     blocked.extend(report[0]); warnings.extend(report[2])
                 except Exception:
                     reports["goplus" if task is gp else "rpc"] = ([], ["Servizio indisponibile"], [])
             if blocked:
-                return finish(blocked, [], warnings, "solana", {"providers": reports})
+                return finish(blocked, [], warnings, "solana", checks())
             if any(not b and not u for b, u, w in reports.values()):
                 # Briefly consume an already-running second source, never wait for indexing.
                 if pending:
-                    extra, pending = await asyncio.wait(pending, timeout=0.1)
+                    extra, pending = await asyncio.wait(pending, timeout=0.03)
                     for task in extra:
                         try:
                             data = task.result()
@@ -175,15 +202,19 @@ async def check_solana(guard, session, address, settings):
                                 token = (data.get("result") or {}).get(address) if data.get("code") == 1 else None
                                 b, u, w = solana_scanner(token, settings)
                             else: b, u, w = solana_native(data, settings)
+                            reports["goplus" if task is gp else "rpc"] = (b, u, w)
                             blocked.extend(b); warnings.extend(w)
                         except Exception: pass
                 if settings["security_mode"] == "strict":
                     warnings.append("Copertura Solana nativa/scanner; simulazione di vendita non disponibile")
                 if len(reports) < 2 or any(u for b, u, w in reports.values()):
                     warnings.append("Copertura rapida/parziale: controlli essenziali verificati da una fonte")
-                warnings.append("Controllo mint/autorità: nessuna simulazione di vendita o verifica dell'importo Maestro")
-                return finish(blocked, [], list(dict.fromkeys(warnings)), "solana", {"providers": reports})
-        return finish([], ["Nessuna fonte verifica tutti i controlli essenziali Solana"], warnings, "solana", {"providers": reports})
+                warnings.extend(item for b, u, w in reports.values() for item in u)
+                warnings.append("Controllo mint/autorità: nessuna simulazione di vendita o verifica dell'importo destinazione")
+                return finish(blocked, [], list(dict.fromkeys(warnings)), "solana", checks())
+        warnings.extend(item for b, u, w in reports.values() for item in u)
+        if pending: warnings.append("Budget esaurito: fonti Solana ancora in attesa; controllo incompleto")
+        return finish([], ["Nessuna fonte completa i controlli Solana"], warnings, "solana", checks())
     finally:
         for task in (gp, rpc): task.cancel()
         await asyncio.gather(gp, rpc, return_exceptions=True)
@@ -212,7 +243,7 @@ def sui_scanner(token, settings):
     if not isinstance(token, dict) or not token:
         return [], ["Sui: coin non ancora indicizzata; blacklist non verificabile"], []
     black = status(token.get("blacklist"), "value")
-    if black in {"1", "2"}: blocked.append("Sui: DenyCap/blacklist può bloccare wallet")
+    if black in {"1", "2"}: (blocked if settings["security_mode"] == "strict" else warnings).append("Sui: DenyCap/blacklist può bloccare wallet; blocco effettivo non verificato")
     elif black != "0": unknown.append("Sui: assenza di blacklist non verificata")
     for key in ("mintable", "contract_upgradeable", "metadata_modifiable"):
         s = status(token.get(key), "value")
@@ -230,7 +261,7 @@ def sui_scanner(token, settings):
 async def check_non_evm(guard, session, kind, address, settings):
     if kind == "solana": return await check_solana(guard, session, address, settings)
     coin = await resolve_sui(guard, session, address)
-    if not coin: return SecurityResult("unknown", ["Sui: package ambiguo/non risolvibile; serve package::modulo::TOKEN"], "sui")
+    if not coin: return SecurityResult("unknown", ["Sui: package ambiguo/non risolvibile; serve package::modulo::TOKEN"], "sui", checks={"identity_error": True})
     payload = await guard._get(session, "https://api.gopluslabs.io/api/v1/sui/token_security", {"contract_addresses": coin})
     tokens = payload.get("result") or {} if payload.get("code") == 1 else {}
     token = next((v for k, v in tokens.items() if canonical_sui(k) == coin), None)

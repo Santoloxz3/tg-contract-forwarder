@@ -1,117 +1,72 @@
-# CA Courier: filtro multichain prima dell’inoltro
+# CA Courier: riconoscimento automatico e filtro su evidenze
 
-Il controllo è sempre attivo prima di inviare un CA al bot di destinazione, anche
-in dry-run. Non usa chiavi private, firme né transazioni. La configurazione viene
-salvata nel SQLite esistente, senza eliminare storico o duplicati.
+Il filtro è sempre attivo prima dell'inoltro, anche in dry-run. Non usa chiavi,
+firme o transazioni. Pannello e verifica manuale riconoscono automaticamente
+EVM (Ethereum, BNB Chain, Base), Solana e Sui. Le informazioni nel pannello
+elencano controlli, avvisi, blocchi e limiti per ogni rete.
 
-## Modalità Bilanciata (default)
+## Modalità rapida (balanced, default)
 
-Blocca restrizioni concrete: blacklist/congelamento, non trasferibilità, vendite
-impedite, modifiche ai saldi, tasse per wallet e commissioni note oltre soglia.
-L’assenza di un controllo **essenziale** resta `unknown` e non autorizza l’inoltro.
-Dati secondari mancanti, mint, metadati modificabili, liquidità non indicizzata e
-certi poteri amministrativi diventano avvisi, non un rifiuto automatico.
+Blocca il contratto MCPAD già verificato malevolo, honeypot rilevati, restrizioni
+di acquisto/vendita rilevate, token non trasferibili, stato iniziale degli account
+congelato/non utilizzabile, pausa nativa attiva e commissioni note oltre soglia.
+Il risultato è una restrizione rilevata, non una prova generale di truffa.
 
-`allowed_with_warnings` significa che i controlli essenziali disponibili sono stati
-superati con copertura e rischi residui esplicitati nel registro. Non significa
-che il token è sicuro, vendibile in futuro o profittevole.
+Capacità amministrative (blacklist, freeze authority, mint, tasse modificabili,
+proxy, delegato permanente, chiusura mint, hook, upgrade, metadati), reputazione,
+liquidità scarsa/assente e dati mancanti sono **avvisi**. Le API indisponibili e i
+timeout autorizzano l'inoltro con `allowed_with_warnings`: il rischio resta
+non verificato. Indirizzi invalidi, indirizzi che RPC identifica come account
+anziché mint e identità ambigue/non risolvibili non vengono inoltrati.
 
-### Solana
+- **EVM:** GoPlus sulle tre reti in parallelo; Dexscreener aggiunge identità e
+  liquidità se pronto. Honeypot, cannot_sell_all, cannot_buy e tasse note oltre
+  soglia bloccano. Gli altri flag e i campi assenti producono avvisi. Non c'è
+  simulazione obbligatoria. Una fonte positiva può chiudere il controllo dopo
+  una finestra di 30 ms; reti lente restano esplicitamente non verificate.
+- **Solana:** GoPlus e RPC `getAccountInfo` partono insieme. SPL/Token-2022,
+  inizializzazione, autorità, trasferibilità, stato account ed estensioni sono
+  analizzati. Commissioni attuali/programmate sono verificate sui basis point
+  nativi. Lo scanner può restituire unità discordanti rispetto alla documentazione:
+  in quel caso si attende RPC entro il budget e si segnala l'incertezza se assente.
+  Poteri amministrativi sono avvisi. `nonTransferable`, default state restrittivo,
+  `pausableConfig.paused=true` e commissioni native oltre soglia bloccano.
+  Nessuna simulazione vendita o verifica di freeze di un wallet specifico.
+- **Sui:** si preserva `package::modulo::TOKEN`; un package nudo si risolve solo
+  con una coin univoca. GoPlus verifica DenyCap/blacklist, mint, upgrade e metadati:
+  sono avvisi in modalità rapida. Nessuna verifica di blacklist sul wallet,
+  simulazione vendita, liquidità, commissioni o routing. Maestro non supporta
+  Sui: il filtro può verificare la coin, ma la destinazione Maestro ferma l'inoltro.
 
-- GoPlus Solana e RPC `getAccountInfo` con `jsonParsed` partono in parallelo.
-- Un risultato completo sui controlli essenziali basta; una seconda fonte già
-  disponibile può aggiungere un blocco. Non si attende una fonte lenta oltre
-  una finestra aggiuntiva di 100 ms. Le richieste residue vengono annullate.
-- La lettura nativa verifica che sia un mint inizializzato di SPL Token o Token-2022,
-  freeze authority ed estensioni. Blocchi per hook attivi, delegato permanente,
-  token non trasferibile, account congelati, pausa, commissioni modificabili,
-  possibilità di chiudere il mint e altre estensioni restrittive. Estensioni
-  sconosciute impediscono di considerare completo il controllo nativo.
-- Non richiede DEX già indicizzato, un numero minimo di holder o pool migrata.
-  Un lancio su bonding curve non viene respinto soltanto perché manca una pool.
-- Mint authority e metadati modificabili sono avvisi. In modalità Prudente la
-  mint authority è bloccante.
+## Modalità prudente (strict, opzionale)
 
-### Sui
+EVM richiede pool, liquidità minima, tutti i flag GoPlus e Honeypot.is con
+simulazione, identità/rete/pool, tasse, limiti, codice e rischio verificati.
+I poteri amministrativi e i dati essenziali mancanti bloccano. Solana blocca
+freeze/mint, hook, delegato, chiusura mint, modifiche delle commissioni, pausa/burn;
+Sui blocca DenyCap, mint e upgrade. Le unità scanner ambigue richiedono conferma
+nativa. Nessuna simulazione usa il wallet/importo del bot destinatario.
 
-- GoPlus Sui verifica la blacklist/DenyCap sul tipo completo della coin.
-- `package::modulo::TOKEN` mantiene maiuscole e minuscole di modulo e tipo.
-- Un package nudo viene risolto via RPC quando individua una sola coin con witness
-  standard e metadati disponibili. Package ambigui, witness non standard o errori
-  RPC richiedono il tipo completo. Le chiamate JSON-RPC Sui sono una compatibilità
-  con i nodi che le espongono; una loro indisponibilità non autorizza a indovinare il tipo.
-- DenyCap/blacklist bloccanti; mint, upgrade e metadati sono avvisi in modalità
-  Bilanciata. Prudente blocca anche mint e upgrade e richiede i relativi esiti.
-- **Maestro non elenca Sui tra le reti supportate**: la verifica Sui è disponibile,
-  ma se la destinazione è Maestro non viene effettuato l’inoltro. Il registro
-  mostra `unsupported_destination`. Una destinazione diversa va configurata nel
-  pannello; il filtro non verifica le capacità di trading di bot terzi.
+## Tempi e persistenza
 
-### EVM
+Il preset richiesto viene applicato una sola volta al primo avvio v3:
+modalità rapida, rete automatica, delay tecnico **1 s**, budget **2,5 s**.
+Le successive modifiche dal pannello persistono normalmente. Sorgente,
+destinazione, dry-run, storico, duplicati e altre soglie sono preservati.
 
-- Ethereum, BNB Chain e Base. Rete esplicita consigliata quando nota: una richiesta
-  GoPlus invece di tre per identificare il token senza attendere Dexscreener.
-- In automatico si interrogano le tre reti in parallelo. Risposte ambigue o
-  identificazione incompleta non autorizzano l’inoltro.
-- GoPlus deve verificare almeno honeypot, blacklist, pausa trasferimenti, modifica
-  saldi e tasse per wallet. Segnali positivi di proxy, proprietario nascosto,
-  autodistruzione e restrizioni di acquisto/vendita sono bloccanti.
-- In Bilanciata, liquidità non indicizzata/sotto soglia, mint, whitelist e tasse
-  globali modificabili sono avvisi. Quest’ultima scelta aumenta il rischio di
-  peggioramenti delle tasse dopo l’acquisto. Non c’è simulazione obbligatoria.
-- Prudente mantiene i controlli completi GoPlus + Honeypot.is, verifica la pool e
-  impone la soglia di liquidità. Non è una simulazione del wallet/importo Maestro.
-- Il contratto MCPAD già analizzato resta sempre bloccato localmente.
+Le richieste partono in parallelo senza attese per età del token, holder,
+indicizzazione o migrazione pool. Il delay si sovrappone al controllo:
+il tempo nominale è `max(delay, durata controllo)`, non la somma. Il budget
+è regolabile da 1 a 10 s, il delay da 0 a 30 s. La tassa massima resta 10%,
+regolabile 0–20%; liquidità EVM $10.000 è un avviso in modalità rapida.
 
-## Tempismo e impostazioni
+Le richieste residue vengono cancellate e non ci sono job periodici o cache
+positive. Dopo FloodWait si ripete il controllo; configurazione cambiata o attesa
+oltre 120 s scartano il messaggio. Storico SQLite conserva esiti, avvisi, dati e
+millisecondi. La verifica manuale autenticata `POST /api/security/check` deduce
+la rete dall'indirizzo e non inoltra nulla. Il comando rimane `python runner.py`.
+RPC opzionali: `SOLANA_RPC_URL`, `SUI_RPC_URL`.
 
-| Impostazione | Default | Intervallo |
-|---|---|---|
-| Modalità | Bilanciata | Bilanciata / Prudente |
-| Budget complessivo verifiche | 4 s | 1–10 s |
-| Rete EVM | auto | auto, 1, 56, 8453 |
-| Tassa massima | 10% | 0–20% |
-| Soglia liquidità EVM | $10.000 | $0–$1.000.000 |
-
-Il budget limita l’attesa, non garantisce il tempo di risposta delle API. Il delay
-tecnico già configurato è separato e si aggiunge alle verifiche. Non ci sono attese
-per indicizzazione, cache di esiti positivi o job periodici. Dopo FloodWait serve
-un nuovo controllo; messaggi in attesa da oltre 120 s o con configurazione cambiata
-vengono scartati. È possibile perdere l’occasione quando un controllo essenziale
-non risponde nel tempo assegnato: il filtro non confonde rapidità con autorizzazione
-su dati assenti.
-
-Il registro conserva esito, avvisi, copertura e durata in millisecondi quando la
-verifica termina. `POST /api/security/check` è autenticato, supporta tutte e tre le
-famiglie di reti e **non inoltra messaggi**. I CA respinti non sono marcati inoltrati.
-Le credenziali esistenti e il comando `python runner.py` restano utilizzabili.
-
-RPC opzionali: `SOLANA_RPC_URL` e `SUI_RPC_URL`; default pubblici di mainnet.
-Non occorrono nuove variabili per il rilascio. Le API pubbliche possono imporre
-rate limit. In modalità rapida una fonte che completa i controlli essenziali può
-bastare; una fonte lenta potrebbe quindi non essere consultata fino in fondo.
-
-## Limiti
-
-Non è un audit completo, non effettua una vendita di prova, non controlla il wallet
-utente né la dimensione dell’acquisto Maestro. Non garantisce assenza di rug pull,
-liquidità bloccata, vincoli del protocollo di lancio, slippage o profitto. Gli scanner
-possono sbagliare e il rischio può cambiare dopo il controllo. Sugli asset Sui la
-lettura dei poteri del token non verifica routing, pool o capacità del bot di trading.
-
-## Validazione e rilascio
-
-```sh
-python -m pip install -r requirements.txt
-python -m unittest -q test_security test_multichain
-python -m py_compile main.py token_security.py non_evm_security.py
-```
-
-I test usano Telegram finto. Coprono blocchi senza invio, fallback nativo per token
-non indicizzati, timeout, estensioni restrittive, avvisi non bloccanti, case e
-ambiguità Sui, destinatario Maestro non compatibile, duplicati, dry-run e FloodWait.
-Railway segue `main`; `/health` espone `version=security-gate-v2`, reti e modalità.
-La tabella degli eventi conserva i report nella colonna `security_json`.
-
-Ripristinare un commit precedente permette il rollback senza cancellare il DB.
-Tornare a un commit privo del filtro ripristina l’inoltro senza controlli.
+Nessun controllo garantisce sicurezza, profitto, assenza di rug pull o vendibilità
+futura. In modalità rapida il vantaggio temporale comporta controlli incompleti:
+non si attende necessariamente ogni fonte e un rischio può non essere rilevato.

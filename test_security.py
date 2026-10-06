@@ -138,7 +138,7 @@ class ProvidersTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_and_unsupported_never_allow(self):
         for kind, address in [("solana", "a" * 40), ("sui", "0x" + "1" * 64), ("evm", "invalid")]:
-            self.assertFalse((await TokenSecurity().check(kind, address, DEFAULT_SETTINGS)).allowed)
+            self.assertFalse((await TokenSecurity().check(kind, address, {**DEFAULT_SETTINGS, "security_mode": "strict"})).allowed)
         self.assertFalse((await self.run_check(pairs=[])).allowed)
         self.assertFalse((await self.run_check(pairs=[self.pair("polygon")])).allowed)
         self.assertFalse((await self.run_check(pairs=[self.pair(), self.pair("ethereum")])).allowed)
@@ -207,6 +207,7 @@ class BotIntegrationTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         self.url = "http://127.0.0.1:" + str(self.site._server.sockets[0].getsockname()[1])
         self.http = aiohttp.ClientSession(headers={"Cookie": "ca_panel=test-cookie"})
+        await self.config(forward_delay_seconds=0)
 
     async def asyncTearDown(self):
         self.client.stop.set(); await self.task

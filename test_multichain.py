@@ -38,9 +38,12 @@ class NativeRulesTest(unittest.TestCase):
     def test_solana_concrete_restrictions_block(self):
         for key in ("freezable", "balance_mutable_authority", "closable", "default_account_state_upgradable", "transfer_fee_upgradable", "transfer_hook_upgradable"):
             data = gp_solana(); data[key]["status"] = "1"
-            self.assertTrue(solana_scanner(data, DEFAULT_SETTINGS)[0], key)
+            self.assertFalse(solana_scanner(data, DEFAULT_SETTINGS)[0], key)
+            self.assertTrue(solana_scanner(data, DEFAULT_SETTINGS)[2], key)
+            self.assertTrue(solana_scanner(data, {**DEFAULT_SETTINGS, "security_mode": "strict"})[0], key)
         data = gp_solana(); data["transfer_hook"] = [{"address": "hook"}]
-        self.assertTrue(solana_scanner(data, DEFAULT_SETTINGS)[0])
+        self.assertFalse(solana_scanner(data, DEFAULT_SETTINGS)[0])
+        self.assertTrue(solana_scanner(data, DEFAULT_SETTINGS)[2])
 
     def test_solana_missing_scanner_core_is_not_safe(self):
         for key in ("freezable", "non_transferable", "transfer_hook", "transfer_fee"):
@@ -54,15 +57,19 @@ class NativeRulesTest(unittest.TestCase):
 
     def test_native_freeze_and_wrong_program_block_or_unknown(self):
         data = native_solana(); data["value"]["data"]["parsed"]["info"]["freezeAuthority"] = "active"
-        self.assertTrue(solana_native(data, DEFAULT_SETTINGS)[0])
-        self.assertTrue(solana_native(native_solana("custom"), DEFAULT_SETTINGS)[1])
+        self.assertFalse(solana_native(data, DEFAULT_SETTINGS)[0])
+        self.assertTrue(solana_native(data, DEFAULT_SETTINGS)[2])
+        self.assertTrue(solana_native(native_solana("custom"), DEFAULT_SETTINGS)[0])
 
     def test_token2022_restrictions_and_unknown_extensions(self):
         for extension, state in [("nonTransferable", {}), ("permanentDelegate", {"delegate": "active"}),
-                                 ("transferHook", {"programId": "hook"}), ("pausableConfig", {})]:
+                                 ("transferHook", {"programId": "hook"}), ("pausableConfig", {"paused": True})]:
             data = native_solana(SPL2022)
             data["value"]["data"]["parsed"]["info"]["extensions"] = [{"extension": extension, "state": state}]
-            self.assertTrue(solana_native(data, DEFAULT_SETTINGS)[0], extension)
+            report = solana_native(data, DEFAULT_SETTINGS)
+            if extension in {"nonTransferable", "pausableConfig"}: self.assertTrue(report[0], extension)
+            else:
+                self.assertFalse(report[0], extension); self.assertTrue(report[2], extension)
         data["value"]["data"]["parsed"]["info"]["extensions"] = [{"extension": "futureExtension"}]
         self.assertTrue(solana_native(data, DEFAULT_SETTINGS)[1])
 
@@ -72,9 +79,10 @@ class NativeRulesTest(unittest.TestCase):
         b, u, _ = solana_native(data, DEFAULT_SETTINGS)
         self.assertFalse(b); self.assertFalse(u)
 
-    def test_sui_blacklist_is_hard_block_but_mint_upgrade_are_warnings(self):
+    def test_sui_capabilities_are_advisories_and_strict_still_blocks(self):
         data = gp_sui(); data["blacklist"]["value"] = "1"
-        self.assertTrue(sui_scanner(data, DEFAULT_SETTINGS)[0])
+        self.assertFalse(sui_scanner(data, DEFAULT_SETTINGS)[0])
+        self.assertTrue(sui_scanner(data, DEFAULT_SETTINGS)[2])
         data = gp_sui(); data["mintable"]["value"] = "1"; data["contract_upgradeable"]["value"] = "1"
         b, u, w = sui_scanner(data, DEFAULT_SETTINGS)
         self.assertFalse(b); self.assertFalse(u); self.assertGreater(len(w), 1)
@@ -106,20 +114,21 @@ class QuickChecksTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_provider_disagreement_hard_block_wins(self):
         guard = TokenSecurity(); bad = native_solana()
-        bad["value"]["data"]["parsed"]["info"]["freezeAuthority"] = "active"
+        bad = native_solana(SPL2022)
+        bad["value"]["data"]["parsed"]["info"]["extensions"] = [{"extension": "nonTransferable", "state": {}}]
         with patch.object(guard, "_get", new=AsyncMock(return_value={"code": 1, "result": {MINT: gp_solana()}})), \
              patch.object(guard, "_rpc", new=AsyncMock(return_value=bad)):
             r = await guard.check("solana", MINT, DEFAULT_SETTINGS)
         self.assertEqual(r.verdict, "blocked")
 
-    async def test_timeout_never_allows_unverified_core(self):
+    async def test_timeout_allows_with_explicit_incomplete_coverage_warning(self):
         guard = TokenSecurity()
         async def slow(*args): await asyncio.sleep(10)
         start = time.monotonic()
         with patch.object(guard, "_get", new=AsyncMock(side_effect=slow)), \
              patch.object(guard, "_rpc", new=AsyncMock(side_effect=slow)):
             r = await guard.check("solana", MINT, {**DEFAULT_SETTINGS, "security_timeout_seconds": 1})
-        self.assertFalse(r.allowed); self.assertLess(time.monotonic() - start, 1.3)
+        self.assertTrue(r.allowed); self.assertTrue(r.warnings); self.assertLess(time.monotonic() - start, 1.3)
 
     async def test_sui_full_type_and_new_mint_can_pass_with_warning(self):
         token = gp_sui(); token["mintable"]["value"] = "1"
@@ -128,12 +137,12 @@ class QuickChecksTest(unittest.IsolatedAsyncioTestCase):
             r = await guard.check("sui", COIN, DEFAULT_SETTINGS)
         self.assertTrue(r.allowed); self.assertEqual(r.checks["forward_address"], canonical_sui(COIN))
 
-    async def test_sui_missing_blacklist_cannot_pass(self):
+    async def test_sui_missing_blacklist_is_an_explicit_warning(self):
         token = gp_sui(); token.pop("blacklist")
         guard = TokenSecurity()
         with patch.object(guard, "_get", new=AsyncMock(return_value={"code": 1, "result": {COIN: token}})):
             r = await guard.check("sui", COIN, DEFAULT_SETTINGS)
-        self.assertFalse(r.allowed)
+        self.assertTrue(r.allowed); self.assertIn("blacklist", r.detail())
 
     async def test_sui_package_resolution_rejects_ambiguity(self):
         guard = TokenSecurity(); pkg = "0x" + "a" * 64
@@ -153,7 +162,7 @@ class QuickChecksTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(r.allowed); self.assertTrue(r.warnings)
 
     async def test_evm_balanced_still_blocks_wallet_traps(self):
-        for flag in ("is_blacklisted", "transfer_pausable", "personal_slippage_modifiable", "is_honeypot"):
+        for flag in ("cannot_sell_all", "cannot_buy", "is_honeypot"):
             token = clean_goplus(); token[flag] = "1"
             guard = TokenSecurity()
             async def get(session, url, params=None):

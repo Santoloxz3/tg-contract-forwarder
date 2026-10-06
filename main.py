@@ -14,7 +14,7 @@ from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
 
 from token_security import DEFAULT_SETTINGS, TokenSecurity, validate_settings
-from non_evm_security import canonical_sui
+from non_evm_security import canonical_sui, valid_mint
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -138,6 +138,24 @@ def save_config(db, config: dict):
     db.commit()
 
 
+def migrate_evidence_policy(db):
+    """Apply the user's requested preset once; subsequent panel edits persist."""
+    if setting_get(db, "evidence_policy_v3", "") == "applied": return
+    for key, value in {"forward_delay_seconds": "1", "security_mode": "balanced",
+                       "security_timeout_seconds": "2.5", "security_chain": "auto"}.items():
+        setting_set(db, key, value)
+    setting_set(db, "evidence_policy_v3", "applied")
+    db.commit()
+
+
+def identify_token(address):
+    address = address.strip()
+    if canonical_sui(address) or re.fullmatch(r"0x[0-9a-fA-F]{64}", address): return "sui"
+    if re.fullmatch(r"0x[0-9a-fA-F]{40}", address): return "evm"
+    if valid_mint(address): return "solana"
+    raise ValueError("Inserisci un indirizzo token valido o il tipo completo della coin Sui")
+
+
 def load_saved_config(db) -> dict:
     env_types = os.getenv("ADDRESS_TYPES", "evm,solana,sui")
     address_types = {
@@ -149,12 +167,12 @@ def load_saved_config(db) -> dict:
         address_types = {"evm", "solana", "sui"}
 
     dry_raw = setting_get(db, "dry_run", os.getenv("DRY_RUN", "true"))
-    delay_raw = setting_get(db, "forward_delay_seconds", os.getenv("FORWARD_DELAY_SECONDS", "2"))
+    delay_raw = setting_get(db, "forward_delay_seconds", os.getenv("FORWARD_DELAY_SECONDS", "1"))
 
     try:
         delay = max(0.0, min(30.0, float(delay_raw)))
     except ValueError:
-        delay = 2.0
+        delay = 1.0
 
     security_settings = validate_settings({key: setting_get(db, key, str(value))
                                            for key, value in DEFAULT_SETTINGS.items()})
@@ -290,6 +308,7 @@ async def main():
     port = int(os.getenv("PORT", "8080"))
 
     db = open_db(db_path)
+    migrate_evidence_policy(db)
     config_lock = asyncio.Lock()
     processing_lock = asyncio.Lock()
     security_test_lock = asyncio.Lock()
@@ -424,8 +443,7 @@ async def main():
                     return
 
                 log.info("Detected %s contract: %s", kind, address)
-                if config_snapshot["forward_delay_seconds"]:
-                    await asyncio.sleep(config_snapshot["forward_delay_seconds"])
+                screening_started = asyncio.get_running_loop().time()
 
                 def still_current():
                     return (revision_snapshot == runtime["config_revision"] and
@@ -443,6 +461,9 @@ async def main():
                 security_report = await screen_contract(db, security_guard, runtime, config_snapshot, kind, address)
                 if not security_report.allowed:
                     return
+                remaining_delay = config_snapshot["forward_delay_seconds"] - (asyncio.get_running_loop().time() - screening_started)
+                if remaining_delay > 0:
+                    await asyncio.sleep(remaining_delay)
                 if not still_current():
                     record_stale()
                     return
@@ -679,21 +700,24 @@ async def main():
             try:
                 payload = await request.json()
                 address = str(payload.get("address", "")).strip()
-                kind = str(payload.get("kind", "evm"))
-                if len(address) > 512 or kind not in ALLOWED_ADDRESS_TYPES:
+                kind = identify_token(address)
+                if len(address) > 512:
                     raise ValueError("Indirizzo o tipo non valido")
                 cfg = runtime["config"].copy()
                 report = await security_guard.check(kind, address, cfg)
                 add_event(db, "security_test", kind, address, cfg["source_chat_raw"],
                           cfg["destination_raw"], report.detail(), report.public())
-                return web.json_response(report.public())
+                return web.json_response({**report.public(), "kind": kind})
             except (ValueError, TypeError):
                 return web.json_response({"error": "Richiesta non valida"}, status=400)
 
     async def health_get(request):
         return web.json_response({"ok": True, "bot": runtime["status"],
-                                  "version": "security-gate-v2", "security_enabled": True,
-                                  "security_fail_closed": True,
+                                  "version": "security-gate-v3", "security_enabled": True,
+                                  "security_fail_closed": runtime["config"]["security_mode"] == "strict",
+                                  "forward_delay_seconds": runtime["config"]["forward_delay_seconds"],
+                                  "security_timeout_seconds": runtime["config"]["security_timeout_seconds"],
+                                  "security_chain": runtime["config"]["security_chain"],
                                   "security_mode": runtime["config"]["security_mode"],
                                   "security_chains": ["evm", "solana", "sui"]})
 
