@@ -1,4 +1,4 @@
-"""Native-chain screening: capabilities are advisories in balanced mode; active restrictions block."""
+"""Native-chain screening with blocking for wallet-freeze/blacklist, pausable transfers and mint authority."""
 import asyncio
 import os
 import re
@@ -51,7 +51,9 @@ def solana_scanner(token, settings):
         return [], ["Scanner Solana: mint non ancora indicizzato"], []
     for key in ("freezable", "balance_mutable_authority", "closable", "default_account_state_upgradable", "transfer_fee_upgradable", "transfer_hook_upgradable"):
         s = status(token.get(key))
-        if s == "1": (blocked if settings["security_mode"] == "strict" else warnings).append(f"Solana: {key} attivo (potere amministrativo)")
+        if s == "1":
+            target = blocked if key == "freezable" or settings["security_mode"] == "strict" else warnings
+            target.append(f"Solana: {key} attivo (potere amministrativo)")
         elif s != "0": unknown.append(f"Solana: {key} non verificato")
     if scalar(token.get("non_transferable")) == "1": blocked.append("Solana: token non trasferibile")
     elif scalar(token.get("non_transferable")) != "0": unknown.append("Solana: trasferibilità non verificata")
@@ -74,11 +76,11 @@ def solana_scanner(token, settings):
                 warnings.append(f"Solana: scanner fee_rate={rate:g}; unità da confermare dalla lettura nativa")
                 if rate: unknown.append("Solana: commissioni dello scanner da confermare con RPC nativo")
     for key in ("mintable", "metadata_mutable"):
-        if status(token.get(key)) == "1": warnings.append(f"Solana: {key} attivo")
-    if settings["security_mode"] == "strict":
-        mint = status(token.get("mintable"))
-        if mint == "1": blocked.append("Solana: mint attivo non ammesso in modalità prudente")
-        elif mint != "0": unknown.append("Solana: mint non verificato in modalità prudente")
+        if status(token.get(key)) == "1":
+            (blocked if key == "mintable" else warnings).append(f"Solana: {key} attivo")
+    mint = status(token.get("mintable"))
+    if mint not in {"0", "1"} and settings["security_mode"] == "strict":
+        unknown.append("Solana: mint non verificato in modalità prudente")
     for creator in token.get("creators", []):
         if isinstance(creator, dict) and str(creator.get("malicious_address")) == "1":
             (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: creatore segnalato malevolo dallo scanner; reputazione non prova di restrizioni")
@@ -102,10 +104,9 @@ def solana_native(result, settings):
     if "freezeAuthority" not in info:
         unknown.append("RPC Solana: freeze authority non verificata")
     elif info["freezeAuthority"] is not None:
-        (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: autorità può congelare account; nessun congelamento del wallet verificato")
+        blocked.append("Solana: autorità può congelare account")
     if info.get("mintAuthority"):
-        warnings.append("Solana: autorità di mint attiva (rischio diluizione)")
-        if settings["security_mode"] == "strict": blocked.append("Solana: mint attivo non ammesso in modalità prudente")
+        blocked.append("Solana: autorità di mint attiva (rischio diluizione)")
     elif "mintAuthority" not in info and settings["security_mode"] == "strict":
         unknown.append("Solana: mint authority non verificata")
     if account["owner"] == SPL2022:
@@ -149,7 +150,7 @@ def solana_native(result, settings):
                     blocked.append("Solana: token non trasferibile")
                 elif kind == "pausableConfig":
                     if state.get("paused") is True: blocked.append("Solana: trasferimenti attualmente sospesi")
-                    else: (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: trasferimenti sospendibili; pausa non confermata")
+                    else: blocked.append("Solana: trasferimenti sospendibili; pausa non confermata")
                 elif kind == "permissionedBurn":
                     (blocked if settings["security_mode"] == "strict" else warnings).append("Solana: permissioned burn presente")
                 else:
@@ -243,17 +244,20 @@ def sui_scanner(token, settings):
     if not isinstance(token, dict) or not token:
         return [], ["Sui: coin non ancora indicizzata; blacklist non verificabile"], []
     black = status(token.get("blacklist"), "value")
-    if black in {"1", "2"}: (blocked if settings["security_mode"] == "strict" else warnings).append("Sui: DenyCap/blacklist può bloccare wallet; blocco effettivo non verificato")
+    if black in {"1", "2"}: blocked.append("Sui: DenyCap/blacklist può bloccare wallet")
     elif black != "0": unknown.append("Sui: assenza di blacklist non verificata")
     for key in ("mintable", "contract_upgradeable", "metadata_modifiable"):
         s = status(token.get(key), "value")
-        if s in {"1", "2"}: warnings.append(f"Sui: {key} attivo")
-        elif s != "0": warnings.append(f"Sui: {key} non ancora verificato")
+        if s in {"1", "2"}:
+            (blocked if key == "mintable" else warnings).append(f"Sui: {key} attivo")
+        elif s != "0":
+            warnings.append(f"Sui: {key} non ancora verificato")
     if settings["security_mode"] == "strict":
-        for key in ("mintable", "contract_upgradeable"):
-            s = status(token.get(key), "value")
-            if s in {"1", "2"}: blocked.append(f"Sui: {key} non ammesso in modalità prudente")
-            elif s != "0": unknown.append(f"Sui: {key} essenziale in modalità prudente")
+        upgradeable = status(token.get("contract_upgradeable"), "value")
+        if upgradeable in {"1", "2"}:
+            blocked.append("Sui: contract_upgradeable non ammesso in modalità prudente")
+        elif upgradeable != "0":
+            unknown.append("Sui: contract_upgradeable essenziale in modalità prudente")
     warnings.append("Sui: nessuna simulazione di vendita, liquidità e routing non verificati")
     return blocked, unknown, warnings
 
