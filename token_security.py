@@ -31,6 +31,17 @@ RISK_FLAGS = {
     "trading_cooldown": "Restrizioni temporali alle operazioni",
     "anti_whale_modifiable": "Limiti di transazione modificabili",
 }
+# In balanced mode these capabilities are considered concrete blockers because
+# they can directly prevent/privilege transfers or alter supply.
+BALANCED_BLOCK_FLAGS = {
+    "is_honeypot",
+    "cannot_sell_all",
+    "cannot_buy",
+    "is_blacklisted",
+    "is_whitelisted",
+    "transfer_pausable",
+    "is_mintable",
+}
 DEFAULT_SETTINGS = {"security_chain": "auto", "security_max_tax_pct": 10.0,
                     "security_min_liquidity_usd": 10000.0,
                     "security_mode": "balanced", "security_timeout_seconds": 2.5}
@@ -248,7 +259,7 @@ class TokenSecurity:
                         for key, label in RISK_FLAGS.items():
                             value = token.get(key)
                             if value == "1":
-                                (blocked if key in {"is_honeypot", "cannot_sell_all", "cannot_buy"} else warnings).append(label)
+                                (blocked if key in BALANCED_BLOCK_FLAGS else warnings).append(label)
                             elif value != "0": warnings.append(f"GoPlus: {key} non verificato")
                         for key in ("buy_tax", "sell_tax", "transfer_tax"):
                             tax = number(token.get(key))
